@@ -440,6 +440,74 @@ function twinSync(level = 5, ticks = 400) {
   };
 }
 
+/* ---------------------------------------------------------- human factors */
+
+/**
+ * Measures how long the bot takes to start responding to something new.
+ *
+ * The dummy is teleported to a completely different bearing after the bot has settled, and
+ * we count ticks until the aim actually starts moving. This picks up the whole chain -
+ * glance interval, smooth-pursuit lag and the inertia of the hand - rather than any one
+ * number in the config, which is the point: a bot that reacts on the tick the world changes
+ * is the single most inhuman thing it can do.
+ */
+function reactionTest(level, { settle = 80, samples = 24 } = {}) {
+  const measurements = [];
+
+  for (let s = 0; s < samples; s++) {
+    dimension.entities.length = 0;
+
+    const bot = new FakeEntity('pvp:bot', { x: 0, y: GROUND_Y, z: 0 });
+    const dummy = new FakeEntity('minecraft:player', { x: 0, y: GROUND_Y, z: 6 });
+    dummy.invincible = true;
+    applyKit(bot, 'diamond');
+
+    const brain = new BotBrain(bot, {
+      level,
+      kit: 'diamond',
+      home: { location: { x: 0, y: GROUND_Y, z: 0 }, dimensionId: 'overworld' },
+    });
+
+    let tick = 0;
+    for (; tick < settle; tick++) {
+      brain.tick(tick);
+      physics(bot);
+    }
+
+    // Teleport the opponent somewhere completely different and count ticks until the bot's
+    // internal picture of the world catches up. Measuring the aim instead would be polluted
+    // by the bot's own movement, which changes the bearing every tick anyway.
+    // Still well inside the bot's target range - the point is to change where the opponent
+    // is, not to make it disappear.
+    const moved = { x: -6, y: GROUND_Y, z: 0 };
+    dummy.location = moved;
+    const jumpTick = tick;
+    let responded;
+
+    for (; tick < jumpTick + 80; tick++) {
+      brain.tick(tick);
+      physics(bot);
+      const seen = brain.perceived?.location;
+      if (seen && Math.hypot(seen.x - moved.x, seen.z - moved.z) < 0.001) {
+        responded = tick - jumpTick;
+        break;
+      }
+    }
+    if (responded !== undefined) measurements.push(responded);
+  }
+
+  measurements.sort((a, b) => a - b);
+  if (measurements.length === 0) throw new Error(`reactionTest: level ${level} never perceived the move`);
+  const mean = measurements.reduce((a, b) => a + b, 0) / measurements.length;
+  return {
+    level,
+    samples: measurements.length,
+    meanTicks: mean,
+    meanMs: mean * 50,
+    spread: measurements.length ? measurements[measurements.length - 1] - measurements[0] : 0,
+  };
+}
+
 /* ------------------------------------------------------- placement rules */
 
 /**
@@ -578,6 +646,36 @@ expect(
 expect(
   twins.mirrorDivergence > 1.5,
   `two identical bots do not move as mirror images (${twins.mirrorDivergence.toFixed(2)} blocks average divergence)`
+);
+
+const reactions = [1, 2, 3, 4, 5].map((l) => reactionTest(l));
+console.log('\nPerception latency: ticks until the bot knows the opponent moved');
+console.log('  Lv   mean      spread');
+for (const r of reactions) {
+  console.log(
+    `  ${r.level}   ${r.meanTicks.toFixed(1).padStart(4)}t ${String(Math.round(r.meanMs)).padStart(4)}ms  ` +
+      `${String(r.spread).padStart(2)}t`
+  );
+}
+expect(
+  reactions.every((r) => r.meanTicks >= 2),
+  'no level perceives a change on the tick it happens'
+);
+expect(
+  reactions.every((r, i) => i === 0 || r.meanTicks <= reactions[i - 1].meanTicks * 1.1),
+  'perception latency falls monotonically with level'
+);
+expect(
+  reactions[4].meanTicks < reactions[0].meanTicks,
+  `reaction time improves with level (${Math.round(reactions[0].meanMs)}ms -> ${Math.round(reactions[4].meanMs)}ms)`
+);
+expect(
+  reactions.every((r) => r.spread > 0),
+  'reaction times vary between attempts rather than being a fixed constant'
+);
+expect(
+  reactions[4].meanMs > 80,
+  `even the best level is not superhuman (${Math.round(reactions[4].meanMs)}ms)`
 );
 
 const rules = placementRules();

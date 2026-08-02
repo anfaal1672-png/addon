@@ -34,7 +34,9 @@ export const ARROW_GRAVITY = 0.05;
  * @typedef {object} LevelProfile
  * @property {number} level
  * @property {string} id
- * @property {number} reactionTicks   Ticks between perception refreshes - the bot aims at where it *last saw* you.
+ * @property {number} reactionTicks   Smooth-pursuit lag, in ticks: how far behind the truth the bot's
+ *   picture of its opponent is while tracking. Human smooth pursuit runs about 100-130 ms, so
+ *   even the top level sits at 3 ticks; going below that is not a better player, it is a robot.
  * @property {number} aimError        Standard aim error in degrees.
  * @property {number} turnSpeed       Max degrees the head can turn per tick.
  * @property {number} cps             Attack attempts per second.
@@ -79,11 +81,15 @@ export const LEVELS = [
     healThreshold: 0.0,
     retreatSkill: 0.1,
     jitter: 0.55,
+    decisionTicks: 13,
+    reactionJitter: 0.45,
+    lapseChance: 0.35,
+    tremor: 0.55,
   },
   {
     level: 2,
     id: 'casual',
-    reactionTicks: 8,
+    reactionTicks: 9,
     aimError: 13,
     turnSpeed: 12,
     cps: 4.0,
@@ -102,11 +108,15 @@ export const LEVELS = [
     healThreshold: 0.25,
     retreatSkill: 0.25,
     jitter: 0.32,
+    decisionTicks: 11,
+    reactionJitter: 0.38,
+    lapseChance: 0.22,
+    tremor: 0.4,
   },
   {
     level: 3,
     id: 'skilled',
-    reactionTicks: 5,
+    reactionTicks: 6,
     aimError: 7,
     turnSpeed: 20,
     cps: 6.5,
@@ -125,11 +135,15 @@ export const LEVELS = [
     healThreshold: 0.4,
     retreatSkill: 0.45,
     jitter: 0.18,
+    decisionTicks: 9,
+    reactionJitter: 0.3,
+    lapseChance: 0.12,
+    tremor: 0.26,
   },
   {
     level: 4,
     id: 'expert',
-    reactionTicks: 3,
+    reactionTicks: 4,
     aimError: 3.2,
     turnSpeed: 32,
     cps: 9.5,
@@ -148,11 +162,15 @@ export const LEVELS = [
     healThreshold: 0.5,
     retreatSkill: 0.7,
     jitter: 0.07,
+    decisionTicks: 6,
+    reactionJitter: 0.22,
+    lapseChance: 0.05,
+    tremor: 0.15,
   },
   {
     level: 5,
     id: 'world_class',
-    reactionTicks: 1,
+    reactionTicks: 3,
     aimError: 1.0,
     turnSpeed: 55,
     cps: 14,
@@ -171,6 +189,10 @@ export const LEVELS = [
     healThreshold: 0.6,
     retreatSkill: 0.95,
     jitter: 0.0,
+    decisionTicks: 4,
+    reactionJitter: 0.16,
+    lapseChance: 0.015,
+    tremor: 0.07,
   },
 ];
 

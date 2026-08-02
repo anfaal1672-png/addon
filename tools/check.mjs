@@ -269,6 +269,11 @@ const monotonic = [
   ['reactionTicks', -1],
   ['aimError', -1],
   ['jitter', -1],
+  // Human factors: all of these should fall as skill rises.
+  ['decisionTicks', -1],
+  ['reactionJitter', -1],
+  ['lapseChance', -1],
+  ['tremor', -1],
 ];
 for (const [key, dir] of monotonic) {
   let ok = true;
@@ -277,6 +282,22 @@ for (const [key, dir] of monotonic) {
     if (delta < 0) ok = false;
   }
   ok ? pass(`${key} moves the right way across levels`) : fail(`${key} is not monotonic across levels`);
+}
+
+// Reaction times are the one place where "better" must still stay human. A bot that reacts
+// faster than a person is not a harder opponent, it is a different kind of thing.
+const HUMAN_FLOOR = { reactionTicks: 2, decisionTicks: 3 };
+for (const [key, floor] of Object.entries(HUMAN_FLOOR)) {
+  const fastest = Math.min(...LEVELS.map((l) => l[key]));
+  fastest >= floor
+    ? pass(`fastest ${key} is ${fastest} ticks (${fastest * 50} ms), at or above the ${floor}-tick human floor`)
+    : fail(`${key} bottoms out at ${fastest} ticks (${fastest * 50} ms) - faster than a person can react`);
+}
+
+for (const key of ['decisionTicks', 'reactionJitter', 'lapseChance', 'tremor']) {
+  LEVELS.every((l) => typeof l[key] === 'number')
+    ? pass(`every level defines ${key}`)
+    : fail(`a level is missing ${key}`);
 }
 
 const missingKit = KIT_ORDER.find((k) => !KITS[k]);

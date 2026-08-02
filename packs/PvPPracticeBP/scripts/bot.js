@@ -38,6 +38,7 @@ import {
   stopHorizontal,
   voidBelow,
 } from './movement.js';
+import { AimAxis, Delayed, HumanState, aimTuning, sampleLatency } from './human.js';
 import { drawTime, incomingThreat, shootArrow } from './ranged.js';
 import { getSettings } from './state.js';
 import {
@@ -93,7 +94,16 @@ export class BotBrain {
     // unison and read as one entity rendered twice. Real opponents are never in phase.
     this.phase = randInt(0, 19);
 
-    this.lastPerceptionTick = -999 + this.phase;
+    /** Reaction times, attention lapses, drift, tilt and hand tremor all live here. */
+    this.human = new HumanState(this.profile);
+    /** Target state the bot is entitled to know about, delayed by smooth-pursuit lag. */
+    this.perceptionQueue = new Delayed();
+    this.nextGlance = -999 + this.phase;
+    /** One entry per thing the bot might notice; each carries its own choice-reaction delay. */
+    this.stimuli = Object.create(null);
+
+    this.aimYawAxis = new AimAxis(safe(() => entity.getRotation().y, 0) ?? 0, { wrap: true });
+    this.aimPitchAxis = new AimAxis(0);
 
     this.lastSwingTick = -999 + this.phase;
     this.lastAirSwing = -999 + this.phase;
@@ -125,6 +135,7 @@ export class BotBrain {
     this.eatingSwapBack = undefined;
     this.lastHealTick = -999;
     this.retreatUntil = 0;
+    this.retreatFrom = Infinity;
     this.recentHits = [];
 
     /** Sprint state lives here: Entity.isSprinting is read-only, so the engine never has it. */
@@ -154,6 +165,7 @@ export class BotBrain {
   setLevel(level) {
     this.level = clamp(Math.round(level), 1, 5);
     this.profile = levelProfile(this.level);
+    this.human.setProfile(this.profile);
     this.refreshName();
   }
 
@@ -185,9 +197,15 @@ export class BotBrain {
       const stickiness = 1 - this.profile.jitter;
       if (chance(0.35 * stickiness)) this.target = source;
     }
-    // A bot that just ate a big combo starts thinking about disengaging.
+    // Being hit rattles people: latencies rise and aim gets shakier for a moment.
+    this.human.rattle(tick);
+
+    // Deciding to disengage is a decision, so it lands a reaction time later rather than on
+    // the same tick as the hit that prompted it.
     if (this.beingCombod(tick) && this.profile.retreatSkill > 0.4) {
-      this.retreatUntil = tick + Math.round(20 + 40 * this.profile.retreatSkill);
+      const delay = Math.round(this.human.decisionLatency(tick));
+      this.retreatFrom = tick + delay;
+      this.retreatUntil = tick + delay + Math.round(20 + 40 * this.profile.retreatSkill);
     }
   }
 
@@ -210,6 +228,29 @@ export class BotBrain {
     };
   }
 
+  /**
+   * Choice reaction time, applied to any yes/no decision.
+   *
+   * Pass whether the condition is true *right now*; this returns whether the bot has had
+   * time to notice it and pick a response. Letting go of the condition resets the clock, so
+   * a stimulus that flickers on and off never gets acted on - which is also what happens to
+   * people.
+   */
+  noticed(key, tick, active) {
+    let s = this.stimuli[key];
+    if (!s) {
+      s = this.stimuli[key] = { readyAt: undefined };
+    }
+    if (!active) {
+      s.readyAt = undefined;
+      return false;
+    }
+    if (s.readyAt === undefined) {
+      s.readyAt = tick + Math.round(this.human.decisionLatency(tick));
+    }
+    return tick >= s.readyAt;
+  }
+
   beingCombod(tick) {
     return this.recentHits.filter((t) => tick - t < 40).length >= 3;
   }
@@ -229,11 +270,21 @@ export class BotBrain {
     // apple, and never swapped its weapon back.
     if (this.eatingItem && tick >= this.eatingUntil) this.finishEating(tick);
 
+    this.human.update(tick);
+
+    const hadTarget = this.target;
     this.acquireTarget(tick);
 
     if (!this.target) {
       this.idle(tick);
       return true;
+    }
+
+    // Noticing a new opponent costs a full choice reaction before anything else happens.
+    if (this.target !== hadTarget) {
+      this.human.engage(tick);
+      this.engageReadyAt = tick + Math.round(this.human.decisionLatency(tick));
+      this.perceptionQueue.clear();
     }
 
     this.perceive(tick);
@@ -313,14 +364,27 @@ export class BotBrain {
    * while a level 5 bot is effectively frame-perfect.
    */
   perceive(tick) {
-    if (tick - this.lastPerceptionTick < this.profile.reactionTicks) return;
-    this.lastPerceptionTick = tick;
-    this.perceived = safe(() => ({
-      location: { ...this.target.location },
-      head: this.target.getHeadLocation ? { ...this.target.getHeadLocation() } : { ...this.target.location },
-      velocity: { ...this.target.getVelocity() },
-      onGround: this.target.isOnGround,
-    }));
+    // Two separate things happen here. The bot looks at its opponent at irregular intervals
+    // rather than on a fixed clock, and what it sees only becomes usable after the smooth-
+    // pursuit lag. A fixed sampling period is machine-like on its own, and zero lag makes
+    // even a "slow" bot able to punish something the instant it happens.
+    if (tick >= this.nextGlance) {
+      const interval = sampleLatency(this.profile.reactionTicks, this.profile.reactionJitter);
+      this.nextGlance = tick + Math.max(1, Math.round(interval));
+
+      const snapshot = safe(() => ({
+        location: { ...this.target.location },
+        head: this.target.getHeadLocation ? { ...this.target.getHeadLocation() } : { ...this.target.location },
+        velocity: { ...this.target.getVelocity() },
+        onGround: this.target.isOnGround,
+      }));
+      if (snapshot) {
+        this.perceptionQueue.push(tick, snapshot, Math.round(this.human.trackingLatency(tick)));
+      }
+    }
+
+    const seen = this.perceptionQueue.read(tick);
+    if (seen) this.perceived = seen;
   }
 
   /* ---------------------------------------------------------------- aiming */
@@ -351,9 +415,11 @@ export class BotBrain {
         : V.add(this.perceived.head, V.scale(this.perceived.velocity, 2 * this.profile.comboSkill));
       const want = directionToRotation(V.sub(to, from));
 
-      const speed = this.profile.turnSpeed;
-      this.aimYaw = approachAngle(this.aimYaw ?? want.y, want.y + this.aimNoise.y, speed);
-      this.aimPitch = clamp(approachAngle(this.aimPitch ?? want.x, want.x + this.aimNoise.x, speed), -89, 89);
+      // The hand is a spring-damper with momentum, not a linear tracker. It overshoots and
+      // corrects, and it never fully stops moving - both of which a perfect tracker cannot do.
+      const tuning = aimTuning(this.profile, this.human.formFactor(tick));
+      this.aimYaw = this.aimYawAxis.step(want.y + this.aimNoise.y, tuning);
+      this.aimPitch = clamp(this.aimPitchAxis.step(want.x + this.aimNoise.x, tuning), -89, 89);
     });
   }
 
@@ -426,6 +492,15 @@ export class BotBrain {
     const vertical = targetLoc.y - self.y;
 
     if (this.maybeSelfPreserve(tick)) return;
+
+    // Still reacting to the opponent showing up: stand there like a person who has not
+    // processed it yet, rather than snapping into a perfect duel stance on frame one.
+    if (tick < (this.engageReadyAt ?? -1)) {
+      stopHorizontal(this.entity);
+      this.faceBody(flat, false, tick);
+      return;
+    }
+
     if (this.maybeHeal(tick, flat)) return;
 
     const wantsBow = this.shouldUseBow(dist, tick);
@@ -452,7 +527,8 @@ export class BotBrain {
     // Disengaging is not the same as backing off a step. Small spacing adjustments are made
     // walking backwards while watching the opponent, but a real retreat means turning round
     // and sprinting, so `disengaging` unlocks both the sprint and the full body turn.
-    const disengaging = tick < (this.retreatUntil ?? 0) && p.retreatSkill > 0.3;
+    const disengaging =
+      tick >= (this.retreatFrom ?? Infinity) && tick < (this.retreatUntil ?? 0) && p.retreatSkill > 0.3;
     if (disengaging) approach = -1;
     this.disengaging = disengaging;
 
@@ -486,7 +562,10 @@ export class BotBrain {
         this.threat = incomingThreat(this.entity, 14);
       }
       const threat = this.threat;
-      if (threat && isAlive(threat.entity) && chance(p.dodgeSkill)) {
+      // A projectile that arrives faster than the bot's reaction time cannot be dodged, which
+      // is why point-blank arrows hit and long-range ones do not.
+      const canSee = threat && threat.ticks >= Math.round(this.human.decisionLatency(tick));
+      if (canSee && isAlive(threat.entity) && chance(p.dodgeSkill)) {
         strafe = 0;
         const dodge = threat.dodge;
         stepWithTerrain(
@@ -708,7 +787,7 @@ export class BotBrain {
     if (!hasItem(this.entity, 'minecraft:bow')) return false;
     if (countItem(this.entity, 'minecraft:arrow') <= 0) return false;
 
-    const retreating = tick < (this.retreatUntil ?? 0);
+    const retreating = tick >= (this.retreatFrom ?? Infinity) && tick < (this.retreatUntil ?? 0);
     const noMelee = !this.preferredMelee();
     const far = dist > 7.5;
     return far || retreating || noMelee;
@@ -801,7 +880,9 @@ export class BotBrain {
       return true;
     }
 
-    if (this.healthFraction > p.healThreshold) return false;
+    // Deciding to eat is a choice reaction, not a threshold trip: a player watches their
+    // health bar drop, thinks about it, and only then commits.
+    if (!this.noticed('heal', tick, this.healthFraction <= p.healThreshold)) return false;
     if (tick - this.lastHealTick < 100) return false;
 
     const enchanted = countItem(this.entity, 'minecraft:enchanted_golden_apple') > 0;
