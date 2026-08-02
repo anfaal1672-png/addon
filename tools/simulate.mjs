@@ -36,6 +36,10 @@ const dimension = {
       setPermutation() {},
     };
   },
+  // Flat arena with nothing to hide behind: every sight line is clear.
+  getBlockFromRay() {
+    return undefined;
+  },
   getEntities({ location, maxDistance }) {
     return this.entities.filter((e) => {
       if (!e.isValid) return false;
@@ -91,6 +95,9 @@ class FakeEntity {
     this.hitsTaken = 0;
     this.tags = new Set();
     this.dynamic = new Map();
+    this.properties = new Map();
+    this.commands = [];
+    this.swings = 0;
     this.nameTag = '';
     this.equipment = new Map();
     this.slots = new Array(36).fill(undefined);
@@ -193,6 +200,17 @@ class FakeEntity {
 
   addEffect() {}
   playAnimation() {}
+  getProperty(k) {
+    return this.properties.get(k);
+  }
+  setProperty(k, v) {
+    this.properties.set(k, v);
+    if (k === 'pvp:swing_id') this.swings++;
+  }
+  runCommand(command) {
+    this.commands.push(command);
+    return { successCount: 1 };
+  }
   hasTag(t) {
     return this.tags.has(t);
   }
@@ -211,8 +229,17 @@ class FakeEntity {
   }
 }
 
-/** One tick of very simple physics: gravity, drag, ground collision. */
+/**
+ * One tick of vanilla-shaped physics: gravity, then movement, then drag.
+ *
+ * Ground and air drag are deliberately different. Vanilla multiplies horizontal velocity by
+ * slipperiness*0.91 on the ground (0.546 on stone) but only 0.91 in the air, which is why
+ * momentum carries you through a jump. Using ground friction everywhere - as this simulator
+ * originally did - makes anything airborne stop dead and wrongly punishes jump-critting.
+ */
 function physics(entity) {
+  const onGround = entity.location.y <= GROUND_Y + 1e-6 && entity.velocity.y <= 0;
+
   entity.velocity.y -= 0.08;
   entity.velocity.y *= 0.98;
   entity.location.x += entity.velocity.x;
@@ -222,8 +249,10 @@ function physics(entity) {
     entity.location.y = GROUND_Y;
     entity.velocity.y = 0;
   }
-  entity.velocity.x *= 0.6;
-  entity.velocity.z *= 0.6;
+
+  const drag = onGround ? 0.546 : 0.91;
+  entity.velocity.x *= drag;
+  entity.velocity.z *= drag;
 }
 
 /* --------------------------------------------------------------- the duel */

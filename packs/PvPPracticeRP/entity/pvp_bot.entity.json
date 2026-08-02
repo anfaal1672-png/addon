@@ -21,18 +21,34 @@
 
       "scripts": {
         "scale": "0.9375",
+        "initialize": [
+          "v.last_swing_id = -1.0;",
+          "v.swing_start = -100.0;",
+          "v.attack_time = -1.0;",
+          "v.use_item_startup_progress = 0.0;",
+          "v.use_item_interval_progress = 0.0;"
+        ],
         "pre_animation": [
           "v.tcos0 = Math.cos(query.modified_distance_moved * 38.17) * query.modified_move_speed / v.gliding_speed_value * 57.3;",
           "v.riding_y_offset = query.is_riding_any_entity_of_type('minecraft:minecart', 'minecraft:boat', 'minecraft:chest_boat', 'minecraft:strider') ? -3.0 : 0.0;",
-          "v.item_use_duration = query.is_using_item ? ((v.item_use_duration ?? 0.0) + query.delta_time * 20.0) : 0.0;",
-          "v.item_use_normalized = v.item_use_duration / query.main_hand_item_max_duration;",
           "v.helmet_layer_visible = 1.0;",
           "v.leg_layer_visible = 1.0;",
           "v.boot_layer_visible = 1.0;",
-          "v.chest_layer_visible = 1.0;"
+          "v.chest_layer_visible = 1.0;",
+          "v.swing_id = q.property('pvp:swing_id');",
+          "(v.swing_id != v.last_swing_id) ? { v.last_swing_id = v.swing_id; v.swing_start = q.life_time; };",
+          "v.swing_elapsed = q.life_time - v.swing_start;",
+          "v.attack_time = (v.swing_elapsed >= 0.0 && v.swing_elapsed < 0.3) ? math.clamp(v.swing_elapsed / 0.3, 0.0, 1.0) : -1.0;",
+          "v.use_item_startup_progress = q.property('pvp:using') > 0 ? 1.0 : 0.0;",
+          "v.use_item_interval_progress = 0.0;",
+          "v.item_use_duration = q.property('pvp:using') > 0 ? ((v.item_use_duration ?? 0.0) + query.delta_time * 20.0) : 0.0;",
+          "v.item_use_normalized = math.clamp(v.item_use_duration / 32.0, 0.0, 1.0);"
         ],
         "variables": {
-          "variable.item_use_normalized": "public"
+          "variable.item_use_normalized": "public",
+          "variable.attack_time": "public",
+          "variable.use_item_startup_progress": "public",
+          "variable.use_item_interval_progress": "public"
         },
         "animate": [
           "look_at_target_controller",

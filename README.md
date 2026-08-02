@@ -75,8 +75,30 @@ npm run build
 !pvp kit <キット名>         近くのボットの装備変更
 !pvp stats                 戦績を開く
 !pvp remote                リモコンをもらう
+!pvp diag                  動作診断（下記）
 !pvp help                  ヘルプ
 ```
+
+### `!pvp diag` — 動作診断
+
+「防具を着ていない」「殴るモーションが出ない」といった症状は原因が複数あり得て、
+アドオン側からは外見だけでは区別できません。そこで実行時に自己診断して結果を表示します。
+
+```
+=== PvP Practice diagnostics ===
+✔ equip.component  setEquipment works (enchantments supported)
+✔ anim.properties  entity properties drive the vanilla swing/eat animations
+✔ inventory.component  container available
+Nearest bot Lv5 kit=netherite
+  head minecraft:netherite_helmet
+  chest minecraft:netherite_chestplate
+  ...
+animation properties swing_id=7 using=0
+inventory 4 stacks
+state sprint=true bodyYaw=134 aimYaw=98
+```
+
+うまく動かないときはこの出力をそのまま報告してもらえれば原因が特定できます。
 
 1.21.80以降のスラッシュコマンドが使える環境では `/pvp:spawn`, `/pvp:clearbots`,
 `/pvp:level`, `/pvp:menu` も自動で登録されます（使えない環境では `!pvp` だけが動きます）。
@@ -172,6 +194,55 @@ npm run build
 統合版では防具と手持ちアイテムは**アタッチャブル**として描画されるため、
 `enable_attachables: true` を入れるだけでプレイヤーとまったく同じ位置に防具が乗ります。
 
+### 防具が装備される仕組み（ハマりどころ）
+
+**`minecraft:equippable` は防具のコンポーネントではありません。** これはラマの絨毯や馬の鞍のように
+「プレイヤーが触って装備させる」ための相互作用コンポーネントで、バニラのゾンビにもスケルトンにも
+**存在しません**。これを防具スロットのつもりで宣言すると、装備が一切付かなくなります。
+
+正しくは、人型Mobは最初から防具スロットを持っており、スクリプト側の
+`EntityEquippableComponent` でそこへ直接アイテムを入れます。
+`kits.js` はこれを試したうえで**入ったかどうかを読み返して確認**し、
+だめなら `/replaceitem` にフォールバックします。どちらの経路が使われたかは `!pvp diag` に出ます
+（`/replaceitem` 経路ではエンチャントが付きません）。
+
+### 殴る・食べるモーションの仕組み
+
+バニラのアニメーションコントローラはこう定義されています。
+
+```
+controller.animation.humanoid.attack             variable.attack_time >= 0 の間だけ再生
+controller.animation.humanoid.use_item_progress  variable.use_item_startup_progress > 0 の間だけ再生
+```
+
+これらの変数は通常エンジンが設定しますが、スクリプトからMolang変数は書けません。
+代わりに**エンティティプロパティ**を書き、リソースパックの `pre_animation` でMolang変数へ橋渡ししています。
+
+```json
+"v.swing_id = q.property('pvp:swing_id');",
+"(v.swing_id != v.last_swing_id) ? { v.last_swing_id = v.swing_id; v.swing_start = q.life_time; };",
+"v.attack_time = (v.swing_elapsed >= 0.0 && v.swing_elapsed < 0.3) ? ... : -1.0;"
+```
+
+プロパティは「振った回数のID」で、経過時間はクライアント側が `query.life_time` から計算します。
+毎ティック同期する必要がなく、**1回の攻撃につきプロパティ書き込み1回**で済みます。
+
+再生されるのは自作アニメーションではなく**バニラのプレイヤーと同じアニメーション**なので、
+振り方も食べ方もプレイヤーと完全に一致します。
+
+### 体と頭が別々に回る仕組み
+
+`Entity.setRotation` の `y` は**頭ではなく体の向き**です（Microsoft公式ドキュメントに明記）。
+毎ティックこれを相手方向へ向けると胴体ごとスナップして回り、一目で人間でないと分かります。
+
+そこで、
+
+- **体の向き** = 移動方向（`setRotation`）。頭との差が50°を超えたときだけ追従する
+- **頭の向き** = ビヘイビアパックの `minecraft:behavior.look_at_player` に任せる
+- **狙いの向き** = ブレインが内部に持つ値（当たり判定・弓の計算に使用）
+
+の3つを分離しています。
+
 ### 戦闘がスクリプト側にある理由
 
 エンティティ定義の `minecraft:attack` は **damage 0** にしてあります。
@@ -182,9 +253,17 @@ npm run build
 - **10ティックの無敵時間を尊重できる**（`applyDamage` は本来これを無視してしまう）
 - CPS・Wタップ・ノックバックをレベルごとに正確に作り分けられる
 
-移動も同様で、バニラAIは `behavior.float`（水に浮く）だけ残し、
-それ以外は `scripts/movement.js` が毎ティック速度を書き換えています。
-インパルスの単位はブロック/ティックなので、プレイヤーと同一速度が正確に出せます。
+移動も同様で、バニラAIは `behavior.float`（水に浮く）とターゲット取得・頭の追従だけ残し、
+それ以外は `scripts/movement.js` が毎ティック速度を**加速度制限つきで**書き換えています。
+
+この加速度制限が重要です。速度を毎ティック上書きすると、**空中でノックバックが止まります**。
+プレイヤーにできない挙動で、最大の違和感になります。バニラは加速度モデルなので、
+
+- 地上: 最大 0.16 ブロック/ティックまで変化（摩擦が支配的なので実質すぐ最高速）
+- 空中: 最大 0.022 ブロック/ティックまで（プレイヤーの空中制御はこの程度しかない）
+
+としています。空中制御の効き具合はレベルの `kbControl` でさらに絞られるので、
+下手なボットは吹き飛ばされたら最後まで飛んでいきます。
 
 ### ファイル構成
 

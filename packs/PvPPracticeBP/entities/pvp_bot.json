@@ -5,7 +5,21 @@
       "identifier": "pvp:bot",
       "is_spawnable": true,
       "is_summonable": true,
-      "is_experimental": false
+      "is_experimental": false,
+      "properties": {
+        "pvp:swing_id": {
+          "type": "int",
+          "range": [0, 15],
+          "default": 0,
+          "client_sync": true
+        },
+        "pvp:using": {
+          "type": "int",
+          "range": [0, 2],
+          "default": 0,
+          "client_sync": true
+        }
+      }
     },
 
     "component_groups": {
@@ -63,16 +77,7 @@
         ]
       },
 
-      "minecraft:equippable": {
-        "slots": [
-          { "slot": 0 },
-          { "slot": 1 },
-          { "slot": 2 },
-          { "slot": 3 },
-          { "slot": 4 },
-          { "slot": 5 }
-        ]
-      },
+      "minecraft:equipment": { "table": "loot_tables/empty.json" },
       "minecraft:inventory": {
         "inventory_size": 36,
         "container_type": "container",
@@ -87,7 +92,30 @@
       "minecraft:nameable": { "always_show": false, "allow_name_tag_renaming": true },
       "minecraft:conditional_bandwidth_optimization": {},
 
-      "minecraft:behavior.float": { "priority": 0 }
+      "minecraft:behavior.float": { "priority": 0 },
+
+      "minecraft:behavior.nearest_attackable_target": {
+        "priority": 1,
+        "must_see": true,
+        "must_see_forget_duration": 3.0,
+        "reselect_targets": true,
+        "within_radius": 32.0,
+        "entity_types": [
+          {
+            "filters": { "test": "is_family", "subject": "other", "value": "player" },
+            "max_dist": 32
+          }
+        ]
+      },
+
+      "minecraft:behavior.look_at_player": {
+        "priority": 8,
+        "look_distance": 32.0,
+        "angle_of_view_horizontal": 360,
+        "angle_of_view_vertical": 360,
+        "probability": 1.0,
+        "look_time": [4.0, 8.0]
+      }
     }
   }
 }

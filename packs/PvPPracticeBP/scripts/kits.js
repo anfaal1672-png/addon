@@ -1,16 +1,35 @@
 /**
  * Kit handling - gives a bot a real survival inventory.
  *
- * Bots wear ordinary armour in ordinary armour slots, so protection, projectile
- * protection and durability all behave exactly as they would on a player.
+ * Getting armour onto a custom mob is the one part of this add-on that cannot be done by
+ * reading the docs alone, because `minecraft:equippable` is *not* the armour component
+ * (it is the llama-carpet / horse-saddle interaction component, and vanilla humanoid mobs
+ * do not have it at all). So this module tries the script component first, verifies the
+ * item actually stuck by reading it back, and falls back to /replaceitem when it did not.
+ * Whichever path worked is recorded in diagnostics.js and printed by `!pvp diag`.
  */
 
 import { EquipmentSlot, ItemStack } from '@minecraft/server';
 import * as mc from '@minecraft/server';
 import { KITS } from './config.js';
+import { record } from './diagnostics.js';
 import { safe } from './util.js';
 
 const ARMOUR_SLOTS = [EquipmentSlot.Head, EquipmentSlot.Chest, EquipmentSlot.Legs, EquipmentSlot.Feet];
+
+/** Script EquipmentSlot -> the slot name /replaceitem uses. */
+const COMMAND_SLOT = {
+  [EquipmentSlot.Head]: 'slot.armor.head',
+  [EquipmentSlot.Chest]: 'slot.armor.chest',
+  [EquipmentSlot.Legs]: 'slot.armor.legs',
+  [EquipmentSlot.Feet]: 'slot.armor.feet',
+  [EquipmentSlot.Mainhand]: 'slot.weapon.mainhand',
+  [EquipmentSlot.Offhand]: 'slot.weapon.offhand',
+};
+
+function equippable(entity) {
+  return safe(() => entity.getComponent('minecraft:equippable'));
+}
 
 function enchant(stack, list) {
   if (!stack || !list?.length) return stack;
@@ -32,14 +51,62 @@ function makeStack(typeId, amount = 1) {
   return safe(() => new ItemStack(typeId, amount));
 }
 
-export function clearEquipment(bot) {
-  safe(() => {
-    const eq = bot.getComponent('minecraft:equippable');
-    if (!eq) return;
-    for (const slot of [...ARMOUR_SLOTS, EquipmentSlot.Mainhand, EquipmentSlot.Offhand]) {
-      eq.setEquipment(slot, undefined);
+/**
+ * Puts one item into one equipment slot and *verifies* it landed there.
+ * @returns {'component'|'command'|'failed'}
+ */
+export function equipItem(entity, slot, stack) {
+  const comp = equippable(entity);
+
+  if (comp) {
+    const applied =
+      safe(() => {
+        comp.setEquipment(slot, stack);
+        return comp.getEquipment(slot)?.typeId === stack?.typeId;
+      }, false) ?? false;
+    if (applied) {
+      record('equip.component', true, 'setEquipment works (enchantments supported)');
+      return 'component';
     }
-  });
+  } else {
+    record('equip.component', false, 'entity has no minecraft:equippable component');
+  }
+
+  // Fallback: the command works on any mob that has real equipment slots, but it cannot
+  // carry enchantments, so kits lose their Protection/Sharpness on this path.
+  const slotName = COMMAND_SLOT[slot];
+  if (slotName && stack) {
+    const ok =
+      safe(() => {
+        entity.runCommand(`replaceitem entity @s ${slotName} 0 ${stack.typeId} ${stack.amount}`);
+        return equippable(entity)?.getEquipment(slot)?.typeId === stack.typeId;
+      }, false) ?? false;
+    // The read-back needs the component; if there is none we cannot verify, so trust the
+    // command not throwing.
+    const ran = ok || (safe(() => {
+      entity.runCommand(`replaceitem entity @s ${slotName} 0 ${stack.typeId} ${stack.amount}`);
+      return true;
+    }, false) ?? false);
+    if (ran) {
+      record('equip.command', true, '/replaceitem works (no enchantments on this path)');
+      return 'command';
+    }
+  }
+
+  record('equip.failed', false, `could not equip ${stack?.typeId ?? 'nothing'} into ${String(slot)}`);
+  return 'failed';
+}
+
+export function getEquipment(entity, slot) {
+  return safe(() => equippable(entity)?.getEquipment(slot));
+}
+
+export function clearEquipment(bot) {
+  const comp = equippable(bot);
+  for (const slot of [...ARMOUR_SLOTS, EquipmentSlot.Mainhand, EquipmentSlot.Offhand]) {
+    if (comp) safe(() => comp.setEquipment(slot, undefined));
+    else safe(() => bot.runCommand(`replaceitem entity @s ${COMMAND_SLOT[slot]} 0 air`));
+  }
   safe(() => {
     const container = bot.getComponent('minecraft:inventory')?.container;
     if (container) container.clearAll();
@@ -51,58 +118,58 @@ export function applyKit(bot, kitId) {
   const kit = KITS[kitId] ?? KITS.none;
   clearEquipment(bot);
 
-  safe(() => {
-    const eq = bot.getComponent('minecraft:equippable');
-    if (!eq) return;
-
-    kit.armour.forEach((typeId, i) => {
-      const stack = enchant(makeStack(typeId), kit.enchants?.armour);
-      if (stack) eq.setEquipment(ARMOUR_SLOTS[i], stack);
-    });
-
-    if (kit.mainhand) {
-      const stack = enchant(makeStack(kit.mainhand), kit.enchants?.[kit.mainhand]);
-      if (stack) eq.setEquipment(EquipmentSlot.Mainhand, stack);
-    }
-    if (kit.offhand) {
-      const stack = makeStack(kit.offhand);
-      if (stack) eq.setEquipment(EquipmentSlot.Offhand, stack);
-    }
+  kit.armour.forEach((typeId, i) => {
+    const stack = enchant(makeStack(typeId), kit.enchants?.armour);
+    if (stack) equipItem(bot, ARMOUR_SLOTS[i], stack);
   });
 
-  safe(() => {
-    const container = bot.getComponent('minecraft:inventory')?.container;
-    if (!container) return;
+  if (kit.mainhand) {
+    const stack = enchant(makeStack(kit.mainhand), kit.enchants?.[kit.mainhand]);
+    if (stack) equipItem(bot, EquipmentSlot.Mainhand, stack);
+  }
+  if (kit.offhand) {
+    const stack = makeStack(kit.offhand);
+    if (stack) equipItem(bot, EquipmentSlot.Offhand, stack);
+  }
+
+  const container = safe(() => bot.getComponent('minecraft:inventory')?.container);
+  record('inventory.component', Boolean(container), container ? 'container available' : 'no inventory container');
+  if (container) {
     for (const entry of kit.inventory ?? []) {
       let left = entry.amount;
       while (left > 0) {
         const take = Math.min(left, 64);
         const stack = makeStack(entry.item, take);
-        if (stack) container.addItem(stack);
+        if (stack) safe(() => container.addItem(stack));
         left -= take;
       }
     }
-  });
+  }
 
   return kit.id;
 }
 
 /** Swaps the bot's main hand to `typeId` if it is carrying one - used to switch bow <-> sword. */
 export function switchMainhand(bot, typeId) {
+  if (!typeId) return false;
   return (
     safe(() => {
-      const eq = bot.getComponent('minecraft:equippable');
+      const comp = equippable(bot);
       const container = bot.getComponent('minecraft:inventory')?.container;
-      if (!eq || !container) return false;
-
-      const current = eq.getEquipment(EquipmentSlot.Mainhand);
+      const current = comp?.getEquipment(EquipmentSlot.Mainhand);
       if (current?.typeId === typeId) return true;
+      if (!container) return false;
 
       for (let i = 0; i < container.size; i++) {
         const stack = container.getItem(i);
         if (stack?.typeId !== typeId) continue;
+        // Swap: what is in hand goes into the slot the new item came from.
         container.setItem(i, current);
-        eq.setEquipment(EquipmentSlot.Mainhand, stack);
+        if (comp) {
+          comp.setEquipment(EquipmentSlot.Mainhand, stack);
+        } else {
+          bot.runCommand(`replaceitem entity @s slot.weapon.mainhand 0 ${stack.typeId} ${stack.amount}`);
+        }
         return true;
       }
       return false;
@@ -114,8 +181,7 @@ export function switchMainhand(bot, typeId) {
 export function hasItem(bot, typeId) {
   return (
     safe(() => {
-      const eq = bot.getComponent('minecraft:equippable');
-      if (eq?.getEquipment(EquipmentSlot.Mainhand)?.typeId === typeId) return true;
+      if (equippable(bot)?.getEquipment(EquipmentSlot.Mainhand)?.typeId === typeId) return true;
       const container = bot.getComponent('minecraft:inventory')?.container;
       if (!container) return false;
       for (let i = 0; i < container.size; i++) {

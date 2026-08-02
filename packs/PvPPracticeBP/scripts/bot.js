@@ -11,6 +11,7 @@
 import { BASE_REACH, IFRAME_TICKS, SPRINT_SPEED, levelProfile } from './config.js';
 import {
   getHeldItem,
+  hasLineOfSight,
   isCriticalPosition,
   swing,
   ticksSinceDamage,
@@ -25,7 +26,17 @@ import {
   towerUp,
 } from './blocks.js';
 import { hasItem, switchMainhand } from './kits.js';
-import { combatVelocity, moveSpeed, stepWithTerrain, stopHorizontal, voidBelow } from './movement.js';
+import { USING_BOW, USING_ITEM, USING_NONE, setUsing } from './anim.js';
+import {
+  combatVelocity,
+  driveHorizontal,
+  jump,
+  moveSpeed,
+  setBodyRotation,
+  stepWithTerrain,
+  stopHorizontal,
+  voidBelow,
+} from './movement.js';
 import { drawTime, incomingThreat, shootArrow } from './ranged.js';
 import { getSettings } from './state.js';
 import {
@@ -34,6 +45,7 @@ import {
   chance,
   clamp,
   directionToRotation,
+  angleDelta,
   gauss,
   isAlive,
   randInt,
@@ -90,9 +102,16 @@ export class BotBrain {
 
     this.bow = { charging: false, startTick: 0, goalTicks: 20, nextShotTick: 0 };
     this.eatingUntil = 0;
+    this.eatingItem = undefined;
+    this.eatingSwapBack = undefined;
     this.lastHealTick = -999;
     this.retreatUntil = 0;
     this.recentHits = [];
+
+    /** Sprint state lives here: Entity.isSprinting is read-only, so the engine never has it. */
+    this.sprinting = false;
+    /** Yaw the body is currently facing, lerped rather than snapped. */
+    this.bodyYaw = safe(() => entity.getRotation().y, 0) ?? 0;
 
     /** @type {{x:number,y:number,z:number,dimensionId:string,water?:boolean}[]} */
     this.placed = [];
@@ -262,6 +281,14 @@ export class BotBrain {
 
   /* ---------------------------------------------------------------- aiming */
 
+  /**
+   * Aim is tracked in the brain, not in the entity's rotation.
+   *
+   * `Entity.setRotation` moves the *body*, and a body that snaps to face you every tick is
+   * the clearest possible tell that something is not a player. So the brain keeps its own
+   * aim yaw/pitch (used for hit detection), the head is left to the look-at goal in the
+   * behaviour pack, and the body is turned separately in `faceBody`.
+   */
   aim(tick) {
     if (tick > this.aimNoiseUntil) {
       const e = this.profile.aimError;
@@ -276,25 +303,37 @@ export class BotBrain {
       const to = V.add(this.perceived.head, lead);
       const want = directionToRotation(V.sub(to, from));
 
-      const current = this.entity.getRotation();
       const speed = this.profile.turnSpeed;
-      const next = {
-        x: clamp(approachAngle(current.x, want.x + this.aimNoise.x, speed), -89, 89),
-        y: approachAngle(current.y, want.y + this.aimNoise.y, speed),
-      };
-      this.entity.setRotation(next);
+      this.aimYaw = approachAngle(this.aimYaw ?? want.y, want.y + this.aimNoise.y, speed);
+      this.aimPitch = clamp(approachAngle(this.aimPitch ?? want.x, want.x + this.aimNoise.x, speed), -89, 89);
     });
   }
 
-  /** How far off the bot's crosshair currently is, in degrees. Gates whether a swing lands. */
+  /**
+   * Turns the body the way a player's body turns: towards where it is walking, catching up
+   * to where the head is looking only when it drifts too far or the bot is standing still.
+   */
+  faceBody(moveDir, moving) {
+    const aimYaw = this.aimYaw ?? this.bodyYaw;
+    let wantYaw = aimYaw;
+    if (moving && (moveDir.x !== 0 || moveDir.z !== 0)) {
+      wantYaw = directionToRotation({ x: moveDir.x, y: 0, z: moveDir.z }).y;
+      // A head can only twist so far off the shoulders; past that the body follows.
+      const off = angleDelta(wantYaw, aimYaw);
+      if (Math.abs(off) > 50) wantYaw = aimYaw - Math.sign(off) * 50;
+    }
+    this.bodyYaw = approachAngle(this.bodyYaw, wantYaw, 22);
+    setBodyRotation(this.entity, this.bodyYaw, this.aimPitch ?? 0);
+  }
+
+  /** How far off the bot's aim currently is from the target, in degrees. */
   aimOffBy() {
     return (
       safe(() => {
         const from = this.entity.getHeadLocation();
         const want = directionToRotation(V.sub(this.perceived.head, from));
-        const cur = this.entity.getRotation();
-        const dy = Math.abs(((want.y - cur.y + 540) % 360) - 180);
-        const dx = Math.abs(want.x - cur.x);
+        const dy = Math.abs(angleDelta(this.aimYaw ?? 0, want.y));
+        const dx = Math.abs((this.aimPitch ?? 0) - want.x);
         return Math.hypot(dx, dy);
       }, 180) ?? 180
     );
@@ -308,7 +347,9 @@ export class BotBrain {
       this.strafeSign = chance(0.5) ? 1 : -1;
     }
     stopHorizontal(this.entity);
+    this.sprinting = false;
     this.bow.charging = false;
+    setUsing(this.entity, USING_NONE);
     this.maybeSelfPreserve(tick);
   }
 
@@ -364,6 +405,14 @@ export class BotBrain {
     // Committing to a chase: you cannot circle someone and outrun them at the same time.
     if (approach > 0.5) strafe *= 0.35;
 
+    // Mid-air the bot is committed to the arc it jumped along - a player does not circle
+    // while airborne either, and pretending to only wastes the little air control there is.
+    const airborne = !(safe(() => this.entity.isOnGround, true) ?? true);
+    if (airborne) {
+      strafe *= 0.3;
+      approach = Math.max(approach, 0.7);
+    }
+
     // Arrow / projectile dodging overrides the strafe direction entirely.
     // The scan is throttled: it is the most expensive call in the tick, and an arrow
     // in flight is still there three ticks later.
@@ -401,17 +450,10 @@ export class BotBrain {
       approach > 0 &&
       chance(0.6 + 0.4 * p.sprintSkill) &&
       p.sprintSkill > 0.05;
+    this.sprinting = sprinting;
+    this.closing = approach > 0.5;
 
-    safe(() => {
-      this.entity.isSprinting = sprinting;
-    });
-
-    // Incoming knockback control: better bots counter-strafe back into you.
     let speedScale = 1;
-    if (p.kbControl > 0 && this.recentHits.length) {
-      const sinceHit = tick - this.recentHits[this.recentHits.length - 1];
-      if (sinceHit < 6) speedScale = 1 + 0.5 * p.kbControl;
-    }
     if (vertical > 1.2) speedScale *= 1.05;
 
     // A circling player cannot also outrun someone sprinting away: the sideways component
@@ -429,7 +471,15 @@ export class BotBrain {
     }
 
     const vel = combatVelocity({ toTarget: flat, approach, strafe, sprinting, speedScale });
-    const terrain = stepWithTerrain(this.entity, vel, { sprinting, allowFall: p.jitter > 0.3 });
+    // Knockback control is real air-strafing now, not a fake speed bonus: a bot with low
+    // kbControl barely steers while airborne, so it takes the full ride from every hit.
+    const terrain = stepWithTerrain(this.entity, vel, {
+      sprinting,
+      allowFall: p.jitter > 0.3,
+      airControl: p.kbControl,
+    });
+    this.faceBody(vel.dir, V.lengthXZ(vel) > 0.02);
+    setUsing(this.entity, USING_NONE);
 
     // Gap in the way: bridge across it rather than giving up the chase.
     if (settings.allowBuilding && terrain.gap >= 3 && p.buildSkill > 0.3 && chance(p.buildSkill)) {
@@ -478,6 +528,31 @@ export class BotBrain {
     );
   }
 
+  /**
+   * The set-up hop for a jump-crit.
+   *
+   * It is a *sprint*-jump only while closing the distance: the vanilla forward boost is what
+   * lets the bot crit someone who is running away. Used at point-blank range it makes the bot
+   * lunge straight past its opponent and, with almost no air control to correct with, spend
+   * the whole fight overshooting - so at range it is a plain vertical hop, which is what a
+   * player actually does to crit someone standing in front of them.
+   */
+  critJump() {
+    const closing = this.closing === true;
+    const flat = this.perceived
+      ? V.normalizeXZ(V.sub(this.perceived.location, this.entity.location))
+      : { x: 0, z: 0 };
+
+    // Point the run-up at the opponent before leaving the ground. Circle-strafing puts most
+    // of the bot's speed on a tangent, and with only a sliver of air control it would sail
+    // off that tangent for the whole jump and land out of reach. This is the last tick where
+    // full ground acceleration is available, so it is the only chance to aim the arc.
+    const speed = moveSpeed(closing && this.sprinting) * (closing ? 1 : 0.55);
+    driveHorizontal(this.entity, flat.x * speed, flat.z * speed);
+
+    jump(this.entity, { sprinting: closing && this.sprinting, forward: closing ? flat : undefined });
+  }
+
   meleeRoutine(tick, dist, vertical) {
     const p = this.profile;
     const reach = Math.min(p.reach, BASE_REACH + 0.05);
@@ -494,6 +569,10 @@ export class BotBrain {
     const interval = Math.max(1, Math.round(20 / p.cps));
     if (tick - this.lastSwingTick < interval) return;
 
+    // A player cannot hit through a wall, so neither can the bot. Checked before the swing
+    // rather than inside it so that the bot does not flail at masonry either.
+    if (!hasLineOfSight(this.entity, this.target)) return;
+
     const since = ticksSinceDamage(this.target.id, tick);
     const disciplined = chance(p.iframeAwareness);
     const onGround = safe(() => this.entity.isOnGround, false) ?? false;
@@ -508,7 +587,7 @@ export class BotBrain {
       // jump-crit so that the apex lines up with the moment invulnerability ends;
       // a bad bot just mashes through it for nothing.
       if (canCrit && onGround && since >= 4 && since <= 7 && chance(p.critSkill)) {
-        safe(() => this.entity.applyImpulse({ x: 0, y: 0.42, z: 0 }));
+        this.critJump();
         this.critWaitUntil = tick + 8;
         return;
       }
@@ -531,6 +610,7 @@ export class BotBrain {
       tick,
       missChance: 1 - hitChance,
       wtap: p.wtapSkill,
+      sprinting: this.sprinting,
     });
 
     if (result === 'hit') {
@@ -571,17 +651,23 @@ export class BotBrain {
       sprinting: false,
       speedScale: 0.85,
     });
-    stepWithTerrain(this.entity, vel, { sprinting: false });
+    stepWithTerrain(this.entity, vel, { sprinting: false, airControl: p.kbControl });
+    this.faceBody(vel.dir, V.lengthXZ(vel) > 0.02);
+    this.sprinting = false;
 
     if (!this.bow.charging) {
-      if (tick < this.bow.nextShotTick) return;
+      if (tick < this.bow.nextShotTick) {
+        setUsing(this.entity, USING_NONE);
+        return;
+      }
       this.bow.charging = true;
       this.bow.startTick = tick;
       this.bow.goalTicks = drawTime(p.bowSkill);
-      safe(() => this.entity.playAnimation('animation.humanoid.bow_and_arrow'));
+      setUsing(this.entity, USING_BOW);
       return;
     }
 
+    setUsing(this.entity, USING_BOW);
     const charged = tick - this.bow.startTick;
     if (charged < this.bow.goalTicks) return;
 
@@ -591,26 +677,45 @@ export class BotBrain {
       spreadDegrees: 16,
     });
     this.bow.charging = false;
+    setUsing(this.entity, USING_NONE);
     this.bow.nextShotTick = tick + randInt(4, 10) + Math.round(10 * (1 - p.bowSkill));
     if (!fired) this.bow.nextShotTick = tick + 20;
   }
 
   /* ------------------------------------------------------------- survival */
 
-  /** Golden apples, exactly as a player would use them: back off, wall up, then eat. */
+  /**
+   * Golden apples, exactly as a player uses them: hold the apple in hand, wall up, spend the
+   * full 32-tick eating animation exposed, and only then get the effects. Applying the buff
+   * the instant the decision is made - which is what this used to do - gives the bot a heal
+   * no player can match and no animation to go with it.
+   */
   maybeHeal(tick, flat) {
     const p = this.profile;
     if (p.healThreshold <= 0) return false;
 
     if (tick < this.eatingUntil) {
-      // Committed to the animation: retreat and hold still-ish while it finishes.
+      setUsing(this.entity, USING_ITEM);
+      // Vanilla plays the eat sound repeatedly through the animation.
+      if ((this.eatingUntil - tick) % 5 === 0) {
+        safe(() => this.entity.dimension.playSound('random.eat', this.entity.location, { volume: 0.7 }));
+      }
+      // Committed: back away while it finishes, and keep facing the threat.
       const vel = combatVelocity({
         toTarget: flat,
         approach: -1,
         strafe: this.strafeSign * p.strafe * 0.5,
         sprinting: false,
+        speedScale: 0.65,
       });
-      stepWithTerrain(this.entity, vel, { sprinting: false });
+      stepWithTerrain(this.entity, vel, { sprinting: false, airControl: p.kbControl });
+      this.faceBody(vel.dir, true);
+      this.sprinting = false;
+      return true;
+    }
+
+    if (this.eatingItem) {
+      this.finishEating(tick);
       return true;
     }
 
@@ -624,12 +729,32 @@ export class BotBrain {
     if (getSettings().allowBuilding && p.buildSkill > 0.4) blockOff(this.entity, flat, this.placed);
 
     const item = enchanted ? 'minecraft:enchanted_golden_apple' : 'minecraft:golden_apple';
-    if (!consumeItem(this.entity, item, 1)) return false;
 
+    // Put the apple in hand so it is visible for the whole animation, then start eating.
+    this.eatingSwapBack = getHeldItem(this.entity)?.typeId;
+    if (!switchMainhand(this.entity, item)) return false;
+
+    this.eatingItem = item;
     this.lastHealTick = tick;
-    this.eatingUntil = tick + 32; // vanilla eat time
-    safe(() => this.entity.dimension.playSound('random.eat', this.entity.location));
+    this.eatingUntil = tick + 32; // vanilla eat time, 1.6 s
+    setUsing(this.entity, USING_ITEM);
+    return true;
+  }
 
+  /** Runs when the 32-tick eat animation completes: consume the item, then apply the effects. */
+  finishEating(tick) {
+    const item = this.eatingItem;
+    this.eatingItem = undefined;
+    setUsing(this.entity, USING_NONE);
+
+    // The apple is only spent once the animation actually finished - interrupt it and the
+    // bot keeps the apple, same as a player.
+    if (!consumeItem(this.entity, item, 1)) {
+      this.restoreHand();
+      return;
+    }
+
+    const enchanted = item === 'minecraft:enchanted_golden_apple';
     safe(() => {
       if (enchanted) {
         this.entity.addEffect('absorption', 2400, { amplifier: 3, showParticles: true });
@@ -641,7 +766,14 @@ export class BotBrain {
         this.entity.addEffect('regeneration', 100, { amplifier: 1, showParticles: true });
       }
     });
-    return true;
+    safe(() => this.entity.dimension.playSound('random.burp', this.entity.location, { volume: 0.6 }));
+    this.restoreHand();
+  }
+
+  restoreHand() {
+    const back = this.eatingSwapBack ?? this.preferredMelee();
+    this.eatingSwapBack = undefined;
+    if (back) switchMainhand(this.entity, back);
   }
 
   /**

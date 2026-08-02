@@ -152,6 +152,65 @@ for (const pack of [BP, RP]) {
 const lootRef = bpEntity?.['minecraft:entity']?.components?.['minecraft:loot']?.table;
 existsSync(join(BP, lootRef ?? '')) ? pass('loot table exists') : fail(`missing loot table: ${lootRef}`);
 
+// Regression guard. `minecraft:equippable` is NOT the armour component - it is the
+// llama-carpet / horse-saddle interaction component, and no vanilla humanoid mob has it.
+// Declaring it made the bot spawn with no armour and no weapon at all.
+const components = bpEntity?.['minecraft:entity']?.components ?? {};
+'minecraft:equippable' in components
+  ? fail('minecraft:equippable is declared - that is the saddle/carpet component, not armour slots')
+  : pass('minecraft:equippable is not declared (it is not the armour component)');
+
+// The vanilla swing and eat animations are driven by Molang variables that the resource pack
+// copies out of entity properties. If a property is renamed on one side only, the animation
+// silently stops playing, which is exactly the kind of break nobody notices until it ships.
+const rpRaw = readFileSync(join(RP, 'entity', 'pvp_bot.entity.json'), 'utf8');
+const declaredProps = Object.keys(bpEntity?.['minecraft:entity']?.description?.properties ?? {});
+const referencedProps = [...rpRaw.matchAll(/q(?:uery)?\.property\('([^']+)'\)/g)].map((m) => m[1]);
+const uniqueRefs = [...new Set(referencedProps)];
+
+if (uniqueRefs.length === 0) {
+  fail('the resource pack does not read any entity property - the swing animation cannot play');
+} else {
+  const missing = uniqueRefs.filter((p) => !declaredProps.includes(p));
+  missing.length
+    ? fail(`resource pack reads undeclared entity properties: ${missing.join(', ')}`)
+    : pass(`entity properties wired to animations: ${uniqueRefs.join(', ')}`);
+}
+
+const unusedProps = declaredProps.filter((p) => !uniqueRefs.includes(p));
+unusedProps.length
+  ? fail(`entity properties declared but never used by the resource pack: ${unusedProps.join(', ')}`)
+  : pass('every declared entity property is consumed by the resource pack');
+
+// Both properties must sync to the client or the animations only play server-side (i.e. never).
+const unsynced = Object.entries(bpEntity?.['minecraft:entity']?.description?.properties ?? {})
+  .filter(([, def]) => def.client_sync !== true)
+  .map(([name]) => name);
+unsynced.length
+  ? fail(`entity properties without client_sync: ${unsynced.join(', ')}`)
+  : pass('all entity properties are client_sync');
+
+// The vanilla humanoid controllers key off these variables; the pre_animation block has to
+// both compute them and mark them public.
+for (const variable of ['variable.attack_time', 'variable.use_item_startup_progress']) {
+  const scripts = rpEntity?.['minecraft:client_entity']?.description?.scripts ?? {};
+  const declared = scripts.variables?.[variable] === 'public';
+  const assigned = JSON.stringify(scripts.pre_animation ?? []).includes(variable.replace('variable.', 'v.'));
+  declared && assigned
+    ? pass(`${variable} is computed and public`)
+    : fail(`${variable} must be assigned in pre_animation and declared public (declared=${declared} assigned=${assigned})`);
+}
+
+// The bow-draw pose only plays while the engine thinks the mob has a target, so the behaviour
+// pack has to give it one even though targeting decisions are made in script.
+'minecraft:behavior.nearest_attackable_target' in components
+  ? pass('bot has an engine target (bow pose + head tracking work)')
+  : fail('no nearest_attackable_target: query.has_target is always false, so the bow pose never plays');
+
+'minecraft:behavior.look_at_player' in components
+  ? pass('head tracking goal present (body and head turn independently)')
+  : fail('no look_at_player goal: the head will not track separately from the body');
+
 /* --------------------------------------------------------- 4. level sanity */
 
 console.log('Level table');

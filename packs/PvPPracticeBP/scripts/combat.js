@@ -3,11 +3,13 @@
  *
  * The bot's vanilla `minecraft:attack` is set to 0 damage on purpose: every hit it lands
  * goes through this module instead, so the numbers come out of the same table a player's
- * weapon uses (base damage + sharpness + critical multiplier), and Bedrock's 10-tick
- * invulnerability window is respected rather than bypassed by script damage.
+ * weapon uses (base damage + sharpness + critical multiplier), Bedrock's 10-tick
+ * invulnerability window is respected rather than bypassed by script damage, and - like a
+ * player - the bot cannot hit anything it does not have a clear line to.
  */
 
 import { EquipmentSlot, system, world } from '@minecraft/server';
+import { playSwing } from './anim.js';
 import {
   CRIT_MULTIPLIER,
   FIST_DAMAGE,
@@ -15,6 +17,7 @@ import {
   SHARPNESS_PER_LEVEL,
   WEAPON_DAMAGE,
 } from './config.js';
+import { getEquipment } from './kits.js';
 import { getSettings } from './state.js';
 import { V, chance, safe } from './util.js';
 
@@ -44,11 +47,11 @@ export function pruneDamageTable(tick) {
 /* ------------------------------------------------------------------ equipment */
 
 export function getHeldItem(entity) {
-  return safe(() => entity.getComponent('minecraft:equippable')?.getEquipment(EquipmentSlot.Mainhand));
+  return getEquipment(entity, EquipmentSlot.Mainhand);
 }
 
 export function getOffhandItem(entity) {
-  return safe(() => entity.getComponent('minecraft:equippable')?.getEquipment(EquipmentSlot.Offhand));
+  return getEquipment(entity, EquipmentSlot.Offhand);
 }
 
 export function enchantLevel(item, enchantId) {
@@ -91,13 +94,56 @@ export function isCriticalPosition(entity) {
   }, false);
 }
 
+/* ---------------------------------------------------------------- line of sight */
+
+/**
+ * A player can only hit what they can actually see. Without this the bot happily swings
+ * through a wall, which is one of the fastest ways to tell it is not a player.
+ *
+ * The ray is cast eye-to-eye and again eye-to-feet, because a target standing behind a
+ * half-height obstacle is still hittable in the head.
+ */
+export function hasLineOfSight(attacker, target) {
+  const from = safe(() => attacker.getHeadLocation());
+  if (!from) return true;
+
+  const aims = [];
+  safe(() => aims.push(target.getHeadLocation()));
+  safe(() => aims.push({ x: target.location.x, y: target.location.y + 0.9, z: target.location.z }));
+  safe(() => aims.push({ ...target.location }));
+  if (!aims.length) return true;
+
+  for (const aim of aims) {
+    const delta = V.sub(aim, from);
+    const distance = V.length(delta);
+    if (distance < 0.05) return true;
+
+    const blocked = safe(() => {
+      const hit = attacker.dimension.getBlockFromRay(from, V.normalize(delta), {
+        maxDistance: distance,
+        includeLiquidBlocks: false,
+        includePassableBlocks: false,
+      });
+      return hit !== undefined;
+    }, false);
+
+    if (!blocked) return true;
+  }
+  return false;
+}
+
 /* ------------------------------------------------------------------- knockback */
 
-/** Extra knockback on top of the engine's, for sprint hits and the Knockback enchantment. */
-export function applyExtraKnockback(target, fromLocation, { sprint = false, knockbackLevel = 0, wtap = 0 }) {
+/**
+ * Extra knockback on top of the engine's, for sprint hits and the Knockback enchantment.
+ *
+ * `sprinting` is passed in rather than read from `entity.isSprinting`, because that property
+ * is read-only on Entity - the bot's sprint state only exists in the brain.
+ */
+export function applyExtraKnockback(target, fromLocation, { sprinting = false, knockbackLevel = 0, wtap = 0 }) {
   const scale = getSettings().knockbackScale;
   let strength = 0;
-  if (sprint) strength += 0.35 + 0.25 * wtap;
+  if (sprinting) strength += 0.35 + 0.25 * wtap;
   strength += knockbackLevel * 0.5;
   if (strength <= 0) return;
 
@@ -129,18 +175,21 @@ export function applyKnockbackCompat(entity, x, z, vertical) {
 
 /**
  * Resolves one melee swing from `attacker` against `target`.
- * @returns {'hit'|'iframe'|'miss'}
+ *
+ * The arm animation plays for every swing including misses - a player's arm moves whether
+ * or not they connect, and a bot whose arm only moves on a hit reads as fake immediately.
+ *
+ * @returns {'hit'|'iframe'|'miss'|'blocked'}
  */
-export function swing(attacker, target, { tick, missChance = 0, forceNoCrit = false, wtap = 0 }) {
+export function swing(attacker, target, { tick, missChance = 0, forceNoCrit = false, wtap = 0, sprinting = false }) {
+  // Always swing the arm, then work out what the swing hit.
+  playSwing(attacker);
+
   if (isInvulnerable(target.id, tick)) return 'iframe';
-
-  const item = getHeldItem(attacker);
-
-  // Swing animation regardless of the outcome - a miss should still look like a miss.
-  safe(() => attacker.playAnimation('animation.humanoid.attack.rotations'));
-
+  if (!hasLineOfSight(attacker, target)) return 'blocked';
   if (missChance > 0 && chance(missChance)) return 'miss';
 
+  const item = getHeldItem(attacker);
   const critical = !forceNoCrit && isCriticalPosition(attacker);
   const amount = meleeDamage(item, { critical });
 
@@ -157,10 +206,16 @@ export function swing(attacker, target, { tick, missChance = 0, forceNoCrit = fa
 
   noteDamaged(target.id, tick);
   applyExtraKnockback(target, attacker.location, {
-    sprint: safe(() => attacker.isSprinting, false) || wtap > 0,
+    sprinting,
     knockbackLevel: enchantLevel(item, 'knockback'),
     wtap,
   });
+
+  safe(() =>
+    attacker.dimension.playSound(critical ? 'game.player.attack.strong' : 'game.player.attack.nodamage', target.location, {
+      volume: 0.9,
+    })
+  );
 
   if (critical) {
     safe(() =>

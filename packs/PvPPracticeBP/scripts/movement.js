@@ -11,16 +11,55 @@
 import { JUMP_POWER, SPRINT_JUMP_BOOST, SPRINT_SPEED, WALK_SPEED } from './config.js';
 import { V, clamp, safe } from './util.js';
 
-/** Sets the horizontal velocity of an entity to (vx, vz), leaving gravity alone. */
-export function driveHorizontal(entity, vx, vz) {
+/**
+ * How fast horizontal velocity may change in one tick.
+ *
+ * Vanilla movement is an acceleration model, not a "set your speed" model. Overwriting the
+ * velocity outright every tick is what made the bot stop dead in mid-air the instant it was
+ * knocked back - a player cannot do that, and it is the single most obvious tell. So the
+ * change is capped: generous on the ground where friction dominates, tiny in the air where
+ * a player only has a sliver of control.
+ */
+export const GROUND_ACCEL = 0.16;
+export const AIR_ACCEL = 0.022;
+
+/**
+ * Steers the entity's horizontal velocity towards (vx, vz), leaving gravity alone.
+ * @param {object} [opts]
+ * @param {number} [opts.airControl] 0..1 - how well this bot uses its air time. Bad players
+ *   barely influence their trajectory once knocked into the air; good ones air-strafe.
+ */
+export function driveHorizontal(entity, vx, vz, { airControl = 1 } = {}) {
   safe(() => {
     const v = entity.getVelocity();
-    entity.applyImpulse({ x: vx - v.x, y: 0, z: vz - v.z });
+    const onGround = entity.isOnGround;
+    const limit = onGround ? GROUND_ACCEL : AIR_ACCEL * clamp(0.25 + 0.75 * airControl, 0, 1);
+
+    let dx = vx - v.x;
+    let dz = vz - v.z;
+    const mag = Math.hypot(dx, dz);
+    if (mag > limit) {
+      dx = (dx / mag) * limit;
+      dz = (dz / mag) * limit;
+    }
+    entity.applyImpulse({ x: dx, y: 0, z: dz });
   });
 }
 
 export function stopHorizontal(entity) {
   driveHorizontal(entity, 0, 0);
+}
+
+/**
+ * Sets body yaw and head pitch.
+ *
+ * `setRotation`'s y component is the *body* rotation, not the head - so pointing it at the
+ * opponent every tick makes the whole torso snap around, which no player does. The body is
+ * therefore aimed along the direction of travel (as vanilla does) and the head is left to
+ * the `minecraft:behavior.look_at_player` goal, which tracks the opponent independently.
+ */
+export function setBodyRotation(entity, yaw, pitch) {
+  safe(() => entity.setRotation({ x: clamp(pitch, -89, 89), y: yaw }));
 }
 
 export function jump(entity, { sprinting = false, forward } = {}) {
@@ -141,7 +180,7 @@ export function combatVelocity({ toTarget, approach, strafe, sprinting, speedSca
  * hops up single blocks, jumps small gaps, and refuses to walk into lava or off a cliff.
  * @returns {{blocked: boolean, gap: number, hazard: boolean, jumped: boolean}}
  */
-export function stepWithTerrain(entity, velocity, { sprinting, allowFall = false }) {
+export function stepWithTerrain(entity, velocity, { sprinting, allowFall = false, airControl = 1 }) {
   const dir = V.normalizeXZ(velocity);
   let jumped = false;
   let blocked = false;
@@ -152,7 +191,7 @@ export function stepWithTerrain(entity, velocity, { sprinting, allowFall = false
     // Refuse the step: slide sideways instead of walking into lava or off a ledge.
     const side = { x: -dir.z, z: dir.x };
     const speed = moveSpeed(false);
-    driveHorizontal(entity, side.x * speed, side.z * speed);
+    driveHorizontal(entity, side.x * speed, side.z * speed, { airControl });
     return { blocked: true, gap: probe.gap, hazard: probe.hazard, jumped: false };
   }
 
@@ -165,6 +204,6 @@ export function stepWithTerrain(entity, velocity, { sprinting, allowFall = false
     jumped = jump(entity, { sprinting, forward: dir });
   }
 
-  driveHorizontal(entity, velocity.x, velocity.z);
+  driveHorizontal(entity, velocity.x, velocity.z, { airControl });
   return { blocked, gap: probe.gap, hazard: probe.hazard, jumped };
 }

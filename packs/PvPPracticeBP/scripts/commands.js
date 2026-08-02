@@ -5,11 +5,14 @@
  *    custom command registry. Registration is optional and failing is not fatal.
  */
 
-import { ItemStack, system, world } from '@minecraft/server';
+import { EquipmentSlot, ItemStack, system, world } from '@minecraft/server';
 import * as mc from '@minecraft/server';
 import { KITS, KIT_ORDER } from './config.js';
+import * as diagnostics from './diagnostics.js';
+import { getEquipment } from './kits.js';
 import { t } from './lang.js';
 import {
+  nearestBrain,
   removeAllBots,
   setBrainKit,
   setBrainLevel,
@@ -59,6 +62,57 @@ function cmdKit(player, args) {
   player.sendMessage(t('cmd.kitSet', t('kit.' + kit)));
 }
 
+/**
+ * Prints what actually works on this build.
+ *
+ * Symptoms like "the bot has no armour" have several possible causes and the add-on cannot
+ * tell which one it hit from the outside. So it probes live and reports: which equipment
+ * path succeeded, whether the animation properties exist, whether the swing/eat bridge is
+ * being driven, and what the nearest bot is currently wearing and holding.
+ */
+function cmdDiag(player) {
+  const lines = ['§l=== PvP Practice diagnostics ===§r', diagnostics.report()];
+
+  const brain = nearestBrain(player, 32);
+  if (!brain) {
+    lines.push('§7No bot within 32 blocks - summon one and run this again for live checks.');
+    player.sendMessage(lines.join('\n'));
+    return;
+  }
+
+  const bot = brain.entity;
+  const slots = [
+    ['head', EquipmentSlot.Head],
+    ['chest', EquipmentSlot.Chest],
+    ['legs', EquipmentSlot.Legs],
+    ['feet', EquipmentSlot.Feet],
+    ['mainhand', EquipmentSlot.Mainhand],
+    ['offhand', EquipmentSlot.Offhand],
+  ];
+
+  lines.push(`§eNearest bot§r Lv${brain.level} kit=${brain.kit}`);
+  for (const [name, slot] of slots) {
+    const item = getEquipment(bot, slot);
+    lines.push(`  ${item ? '§a' : '§8'}${name}§r ${item ? item.typeId : '(empty)'}`);
+  }
+
+  const swingId = safe(() => bot.getProperty('pvp:swing_id'));
+  const using = safe(() => bot.getProperty('pvp:using'));
+  lines.push(
+    `§eanimation properties§r swing_id=${swingId ?? '§cundefined§r'} using=${using ?? '§cundefined§r'}`
+  );
+
+  const container = safe(() => bot.getComponent('minecraft:inventory')?.container);
+  let stacks = 0;
+  if (container) {
+    for (let i = 0; i < container.size; i++) if (container.getItem(i)) stacks++;
+  }
+  lines.push(`§einventory§r ${container ? `${stacks} stacks` : '§cno container§r'}`);
+  lines.push(`§estate§r sprint=${brain.sprinting} bodyYaw=${Math.round(brain.bodyYaw)} aimYaw=${Math.round(brain.aimYaw ?? 0)}`);
+
+  player.sendMessage(lines.join('\n'));
+}
+
 export function giveRemote(player) {
   const ok =
     safe(() => {
@@ -94,6 +148,9 @@ function dispatch(player, argv) {
       return openStats(player);
     case 'remote':
       return giveRemote(player);
+    case 'diag':
+    case 'debug':
+      return cmdDiag(player);
     case 'help':
       return openHelp(player);
     default:

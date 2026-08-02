@@ -71,6 +71,7 @@ const STRINGS = {
       '§7!pvp kit <名前>§r 近くのボットの装備変更\n' +
       '§7!pvp menu§r このメニューを開く\n' +
       '§7!pvp stats§r 戦績\n' +
+      '§7!pvp diag§r 動作診断 (装備・アニメの実状態を表示)\n' +
       '§7!pvp help§r ヘルプ\n\n' +
       '§eレベルの目安§r\n' +
       '§7Lv1§r 初心者 - 反応が遅く棒立ち\n' +
@@ -167,6 +168,7 @@ const STRINGS = {
       '§7!pvp kit <name>§r re-equip the nearest bot\n' +
       '§7!pvp menu§r open this menu\n' +
       '§7!pvp stats§r statistics\n' +
+      '§7!pvp diag§r runtime diagnostics (what actually equipped/animated)\n' +
       '§7!pvp help§r help\n\n' +
       '§eLevels§r\n' +
       '§7Lv1§r beginner - slow, mostly stands still\n' +
