@@ -19,6 +19,7 @@ const { BotBrain } = await load('bot.js');
 const { applyKit } = await load('kits.js');
 const { ARROW_SPEED, IFRAME_TICKS } = await load('config.js');
 const { PLACE_COOLDOWN, placeBlock } = await load('blocks.js');
+const { jump } = await load('movement.js');
 
 /* ------------------------------------------------------------- fake world */
 
@@ -241,19 +242,38 @@ class FakeEntity {
 function physics(entity) {
   const onGround = entity.location.y <= GROUND_Y + 1e-6 && entity.velocity.y <= 0;
 
-  entity.velocity.y -= 0.08;
-  entity.velocity.y *= 0.98;
+  // Vanilla order: move first, *then* apply gravity and drag. Applying gravity before the
+  // first move eats part of the launch velocity and makes every jump measure short, which
+  // hid the fact that jump height was wrong in the add-on too.
   entity.location.x += entity.velocity.x;
   entity.location.y += entity.velocity.y;
   entity.location.z += entity.velocity.z;
+
   if (entity.location.y < GROUND_Y) {
     entity.location.y = GROUND_Y;
     entity.velocity.y = 0;
+  } else {
+    entity.velocity.y = (entity.velocity.y - 0.08) * 0.98;
   }
 
   const drag = onGround ? 0.546 : 0.91;
   entity.velocity.x *= drag;
   entity.velocity.z *= drag;
+}
+
+/**
+ * The height a vanilla player's jump reaches: launch at 0.42 blocks/tick, then
+ * v = (v - 0.08) * 0.98 each tick. Summing the positive velocities gives ~1.2522 blocks,
+ * which is why a player clears a single block and nothing more.
+ */
+function vanillaJumpApex() {
+  let v = 0.42;
+  let y = 0;
+  while (v > 0) {
+    y += v;
+    v = (v - 0.08) * 0.98;
+  }
+  return y;
 }
 
 /* --------------------------------------------------------------- the duel */
@@ -438,6 +458,27 @@ function twinSync(level = 5, ticks = 400) {
     overlap: total ? shared / total : 0,
     mirrorDivergence: mirrorGaps.reduce((x, y) => x + y, 0) / mirrorGaps.length,
   };
+}
+
+/* ------------------------------------------------------------ jump height */
+
+/** Measures how high the bot actually gets off the ground when it jumps. */
+function jumpHeight() {
+  dimension.entities.length = 0;
+  const bot = new FakeEntity('pvp:bot', { x: 0, y: GROUND_Y, z: 0 });
+
+  // Settle so the entity carries the same residual downward velocity a grounded entity has.
+  for (let i = 0; i < 5; i++) physics(bot);
+  const residual = bot.velocity.y;
+
+  jump(bot);
+  let apex = bot.location.y;
+  for (let i = 0; i < 40; i++) {
+    physics(bot);
+    apex = Math.max(apex, bot.location.y);
+    if (bot.location.y <= GROUND_Y && i > 2) break;
+  }
+  return { apex: apex - GROUND_Y, residual };
 }
 
 /* ---------------------------------------------------------- human factors */
@@ -646,6 +687,17 @@ expect(
 expect(
   twins.mirrorDivergence > 1.5,
   `two identical bots do not move as mirror images (${twins.mirrorDivergence.toFixed(2)} blocks average divergence)`
+);
+
+const jumpResult = jumpHeight();
+const expectedApex = vanillaJumpApex();
+console.log(
+  `\nJump apex ${jumpResult.apex.toFixed(4)} blocks ` +
+    `(vanilla ${expectedApex.toFixed(4)}, grounded residual velocity ${jumpResult.residual.toFixed(4)})`
+);
+expect(
+  Math.abs(jumpResult.apex - expectedApex) < 0.02,
+  `jump reaches the vanilla apex (${jumpResult.apex.toFixed(3)} vs ${expectedApex.toFixed(3)} blocks)`
 );
 
 const reactions = [1, 2, 3, 4, 5].map((l) => reactionTest(l));

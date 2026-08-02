@@ -244,6 +244,22 @@ wrongAnimations.length
   ? fail(`not using the player's own animations: ${wrongAnimations.join('; ')}`)
   : pass("visible animations are the player's, not the humanoid/zombie variants");
 
+// controller.animation.humanoid.bow_and_arrow switches on query.has_target alone. Since the
+// bot now always has an engine target during a fight, including it would pose the arms as if
+// aiming a bow while holding a sword.
+const animateList = JSON.stringify(rpEntity?.['minecraft:client_entity']?.description?.scripts?.animate ?? []);
+animateList.includes('bow_and_arrow')
+  ? fail('bow_and_arrow controller is in the animate list - it fires on has_target regardless of the held item')
+  : pass('bow pose is not driven by has_target');
+
+animations.bow_equipped === 'animation.player.bow_equipped'
+  ? pass('bow draw uses the player animation')
+  : fail(`bow draw should be animation.player.bow_equipped, is ${animations.bow_equipped}`);
+
+animateList.includes("bow_equipped") && animateList.includes("pvp:using")
+  ? pass('bow pose is gated on the script-driven using property')
+  : fail('bow pose is not gated on pvp:using - it will never play, or never stop');
+
 // animation.player.attack.rotations and move.* need these, and Molang has no defaults.
 for (const variable of ['variable.attack_body_rot_y', 'variable.tcos0']) {
   const scripts = rpEntity?.['minecraft:client_entity']?.description?.scripts ?? {};

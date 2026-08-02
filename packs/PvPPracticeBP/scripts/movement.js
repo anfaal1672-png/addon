@@ -62,14 +62,24 @@ export function setBodyRotation(entity, yaw, pitch) {
   safe(() => entity.setRotation({ x: clamp(pitch, -89, 89), y: yaw }));
 }
 
+/**
+ * Jumps with exactly a player's launch velocity, which is what makes the apex land at the
+ * vanilla 1.25 blocks.
+ *
+ * `applyImpulse` *adds* to the current velocity, and an entity resting on the ground is not
+ * at rest vertically - it still carries the small negative y velocity from the gravity that
+ * was applied before the collision stopped it. Adding 0.42 to that produced a jump visibly
+ * short of a player's, so the residual is cancelled out first.
+ */
 export function jump(entity, { sprinting = false, forward } = {}) {
   return (
     safe(() => {
       if (!entity.isOnGround) return false;
       const boost = sprinting && forward ? SPRINT_JUMP_BOOST : 0;
+      const vy = entity.getVelocity().y;
       entity.applyImpulse({
         x: forward ? forward.x * boost : 0,
-        y: JUMP_POWER,
+        y: JUMP_POWER - vy,
         z: forward ? forward.z * boost : 0,
       });
       return true;

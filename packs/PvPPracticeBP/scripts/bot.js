@@ -574,7 +574,7 @@ export class BotBrain {
           { sprinting: true }
         );
         if (threat.ticks < 6 && chance(p.dodgeSkill * 0.5)) {
-          safe(() => this.entity.isOnGround && this.entity.applyImpulse({ x: 0, y: 0.42, z: 0 }));
+          jump(this.entity);
         }
         return;
       }
@@ -634,7 +634,7 @@ export class BotBrain {
     if (settings.allowBuilding && this.beingCombod(tick) && p.buildSkill > 0.5) {
       if (chance(p.buildSkill * 0.25)) {
         if (this.healthFraction < 0.4) {
-          safe(() => this.entity.isOnGround && this.entity.applyImpulse({ x: 0, y: 0.42, z: 0 }));
+          jump(this.entity);
           towerUp(this.entity, this.placed, this.placeOpts(tick));
         } else {
           blockOff(this.entity, flat, this.placed, this.placeOpts(tick));
@@ -750,7 +750,7 @@ export class BotBrain {
       if (disciplined) return;
     } else if (canCrit && onGround && chance(p.critSkill)) {
       // Opening hit of an exchange: hop first, connect on the way down.
-      safe(() => this.entity.applyImpulse({ x: 0, y: 0.42, z: 0 }));
+      jump(this.entity);
       this.critWaitUntil = tick + 8;
       return;
     }
