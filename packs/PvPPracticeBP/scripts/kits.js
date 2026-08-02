@@ -280,6 +280,11 @@ export function switchMainhand(bot, typeId) {
 
   // Command path: mirror into the display slot only. The item stays in the inventory, which
   // is the only place this path can find or spend it later.
+  //
+  // Already holding it is a no-op. meleeRoutine re-selects the weapon every tick, so without
+  // this the bot would fire twenty /replaceitem commands a second, each one rebuilding the
+  // item from scratch.
+  if (virtualHand.get(bot.id) === typeId) return true;
   if (countItem(bot, typeId) <= 0) return false;
   const shown =
     safe(() => {

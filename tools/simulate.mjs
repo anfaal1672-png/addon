@@ -602,18 +602,32 @@ function noComponentPath() {
 
   const applesBefore = count('minecraft:golden_apple');
   const swappedToApple = switchMainhand(bot, 'minecraft:golden_apple');
+  // The reported symptom was precisely this pair: the apple *was* visibly in the bot's hand,
+  // and it still never got eaten. So assert the visible half separately from the effect.
+  const appleShown = bot.commands.some((c) => c.includes('slot.weapon.mainhand') && c.includes('golden_apple'));
   const ateApple = consumeHeldItem(bot, 'minecraft:golden_apple', 1);
   const applesAfter = count('minecraft:golden_apple');
 
+  // Holding the same item again must not re-issue the command; meleeRoutine calls this every
+  // tick, which would be twenty commands a second per bot.
+  const beforeRepeat = bot.commands.length;
+  switchMainhand(bot, 'minecraft:golden_apple');
+  switchMainhand(bot, 'minecraft:golden_apple');
+  const repeatCommands = bot.commands.length - beforeRepeat;
+
   const backToSword = switchMainhand(bot, 'minecraft:diamond_sword');
+  const swordShown = bot.commands.some((c) => c.includes('slot.weapon.mainhand') && c.includes('diamond_sword'));
 
   return {
     didPlace,
     cobbleSpent: cobbleBefore - cobbleAfter,
     swappedToApple,
+    appleShown,
     ateApple,
     applesSpent: applesBefore - applesAfter,
+    repeatCommands,
     backToSword,
+    swordShown,
     commands: bot.commands.length,
   };
 }
@@ -810,9 +824,15 @@ console.log('\nItem handling without a minecraft:equippable component');
 expect(noComp.didPlace, 'blocks are still placed');
 expect(noComp.cobbleSpent === 1, `exactly one cobblestone is spent (spent ${noComp.cobbleSpent})`);
 expect(noComp.swappedToApple, 'the bot can switch to a golden apple');
-expect(noComp.ateApple, 'the apple is actually consumed');
+expect(noComp.appleShown, 'the apple is visibly placed in the hand');
+expect(noComp.ateApple, 'the apple is actually consumed, not just held');
+expect(
+  noComp.repeatCommands === 0,
+  `re-selecting the item already held issues no command (issued ${noComp.repeatCommands})`
+);
 expect(noComp.applesSpent === 1, `exactly one apple is spent (spent ${noComp.applesSpent})`);
 expect(noComp.backToSword, 'the bot switches back to its sword afterwards');
+expect(noComp.swordShown, 'the sword is visibly back in the hand');
 expect(noComp.commands > 0, 'the /replaceitem fallback was actually exercised');
 
 const rules = placementRules();
