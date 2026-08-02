@@ -1,0 +1,99 @@
+{
+  "format_version": "1.21.0",
+  "minecraft:entity": {
+    "description": {
+      "identifier": "pvp:bot",
+      "is_spawnable": true,
+      "is_summonable": true,
+      "is_experimental": false
+    },
+
+    "component_groups": {
+      "pvp:despawn": {
+        "minecraft:instant_despawn": {}
+      }
+    },
+
+    "events": {
+      "pvp:despawn": {
+        "add": { "component_groups": ["pvp:despawn"] }
+      }
+    },
+
+    "components": {
+      "minecraft:type_family": {
+        "family": ["pvp_bot", "humanoid", "mob"]
+      },
+
+      "//body": "--- Player-identical body / physics ---",
+      "minecraft:collision_box": { "width": 0.6, "height": 1.8 },
+      "minecraft:physics": { "has_collision": true, "has_gravity": true },
+      "minecraft:pushable": { "is_pushable": true, "is_pushable_by_piston": true },
+      "minecraft:can_climb": {},
+      "minecraft:jump.static": { "jump_power": 0.42 },
+      "minecraft:movement.basic": {},
+      "minecraft:movement": { "value": 0.1 },
+      "minecraft:underwater_movement": { "value": 0.02 },
+      "minecraft:navigation.walk": {
+        "is_amphibious": false,
+        "avoid_water": true,
+        "can_pass_doors": true,
+        "can_open_doors": true,
+        "can_break_doors": false,
+        "can_jump": true,
+        "can_sink": true,
+        "avoid_damage_blocks": true,
+        "avoid_portals": true
+      },
+
+      "//vitals": "--- Player-identical vitals: 20 HP, drowns, burns, falls ---",
+      "minecraft:health": { "value": 20, "max": 20 },
+      "minecraft:breathable": {
+        "total_supply": 15,
+        "suffocate_time": 0,
+        "breathes_air": true,
+        "breathes_water": false
+      },
+      "minecraft:knockback_resistance": { "value": 0 },
+      "minecraft:hurt_on_condition": {
+        "damage_conditions": [
+          {
+            "filters": { "test": "in_lava", "subject": "self", "operator": "==", "value": true },
+            "cause": "lava",
+            "damage_per_tick": 4
+          }
+        ]
+      },
+
+      "//gear": "--- Full player-style equipment: 4 armour slots + main hand + off hand ---",
+      "minecraft:equippable": {
+        "slots": [
+          { "slot": 0 },
+          { "slot": 1 },
+          { "slot": 2 },
+          { "slot": 3 },
+          { "slot": 4 },
+          { "slot": 5 }
+        ]
+      },
+      "minecraft:inventory": {
+        "inventory_size": 36,
+        "container_type": "container",
+        "can_be_siphoned_from": false,
+        "private": true
+      },
+      "//attack": "Vanilla melee is disabled - all damage is dealt by scripts/combat.js so that it matches survival weapon rules exactly.",
+      "minecraft:attack": { "damage": 0 },
+
+      "//practice": "--- Practice targets: no drops, no XP, never despawn ---",
+      "minecraft:loot": { "table": "loot_tables/empty.json" },
+      "minecraft:experience_reward": { "on_death": "0" },
+      "minecraft:persistent": {},
+      "minecraft:nameable": { "always_show": false, "allow_name_tag_renaming": true },
+      "minecraft:conditional_bandwidth_optimization": {},
+
+      "//ai": "--- Only float is left to vanilla AI. All combat/movement is driven by scripts/bot.js ---",
+      "minecraft:behavior.float": { "priority": 0 }
+    }
+  }
+}

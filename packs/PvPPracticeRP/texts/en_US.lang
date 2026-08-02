@@ -1,0 +1,6 @@
+pack.name=PvP Practice Add-on [Resources]
+pack.description=Adds the Steve-identical look for the PvP practice bots.
+
+item.pvp:remote.name=PvP Remote
+entity.pvp:bot.name=Steve
+item.spawn_egg.entity.pvp:bot.name=Spawn PvP Bot

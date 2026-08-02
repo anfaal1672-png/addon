@@ -1,0 +1,6 @@
+pack.name=PvP練習アドオン [リソース]
+pack.description=スティーブそっくりのPvPボットの見た目を追加します。
+
+item.pvp:remote.name=PvPリモコン
+entity.pvp:bot.name=Steve
+item.spawn_egg.entity.pvp:bot.name=スポーン: PvPボット
