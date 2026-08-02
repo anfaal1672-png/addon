@@ -207,9 +207,50 @@ for (const variable of ['variable.attack_time', 'variable.use_item_startup_progr
   ? pass('bot has an engine target (bow pose + head tracking work)')
   : fail('no nearest_attackable_target: query.has_target is always false, so the bow pose never plays');
 
+// look_at_target follows the entity's *current opponent*. look_at_player would make a bot
+// stare at the nearest human even while duelling another bot.
+'minecraft:behavior.look_at_target' in components
+  ? pass('head tracks the actual opponent (not whichever player is nearest)')
+  : fail('no look_at_target goal: the head will not track separately from the body');
+
 'minecraft:behavior.look_at_player' in components
-  ? pass('head tracking goal present (body and head turn independently)')
-  : fail('no look_at_player goal: the head will not track separately from the body');
+  ? fail('look_at_player makes bots stare at the nearest human even when fighting each other')
+  : pass('look_at_player is not used');
+
+// The engine target list has to include other bots, or bot-vs-bot duels have no engine
+// target at all - no head tracking and no bow pose.
+const targetFamilies = (components['minecraft:behavior.nearest_attackable_target']?.entity_types ?? [])
+  .map((e) => e.filters?.value)
+  .filter(Boolean);
+['player', 'pvp_bot'].every((f) => targetFamilies.includes(f))
+  ? pass(`bots can target ${targetFamilies.join(' and ')}`)
+  : fail(`nearest_attackable_target is missing a family: has ${targetFamilies.join(', ') || 'none'}`);
+
+// The bot must animate like a player, not like a zombie. These are the animations that are
+// actually visible in a fight; the humanoid variants are subtly different.
+const animations = rpEntity?.['minecraft:client_entity']?.description?.animations ?? {};
+const mustBePlayerAnimations = {
+  'move.arms': 'animation.player.move.arms',
+  'move.legs': 'animation.player.move.legs',
+  'attack.rotations': 'animation.player.attack.rotations',
+  holding: 'animation.player.holding',
+  sneaking: 'animation.player.sneaking',
+  bob: 'animation.player.bob',
+};
+const wrongAnimations = Object.entries(mustBePlayerAnimations)
+  .filter(([key, expected]) => animations[key] !== expected)
+  .map(([key, expected]) => `${key} should be ${expected}, is ${animations[key]}`);
+wrongAnimations.length
+  ? fail(`not using the player's own animations: ${wrongAnimations.join('; ')}`)
+  : pass("visible animations are the player's, not the humanoid/zombie variants");
+
+// animation.player.attack.rotations and move.* need these, and Molang has no defaults.
+for (const variable of ['variable.attack_body_rot_y', 'variable.tcos0']) {
+  const scripts = rpEntity?.['minecraft:client_entity']?.description?.scripts ?? {};
+  JSON.stringify(scripts.pre_animation ?? []).includes(variable.replace('variable.', 'v.'))
+    ? pass(`${variable} is computed for the player animations`)
+    : fail(`${variable} is required by the player animations but never computed`);
+}
 
 /* --------------------------------------------------------- 4. level sanity */
 

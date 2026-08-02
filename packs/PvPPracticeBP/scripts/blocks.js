@@ -7,6 +7,8 @@
  */
 
 import { BlockPermutation } from '@minecraft/server';
+import { playSwing } from './anim.js';
+import { switchMainhand } from './kits.js';
 import { getSettings } from './state.js';
 import { V, safe } from './util.js';
 
@@ -88,6 +90,11 @@ export function placeBlock(bot, pos, typeId, tracker) {
   if (!getSettings().allowBuilding) return false;
   const dim = bot.dimension;
   if (!canPlaceAt(dim, pos)) return false;
+
+  // A player has to be holding the block to place it, and their arm swings when they do.
+  // Without both of these the bot conjures blocks out of nothing with a motionless arm,
+  // which is unmistakable.
+  switchMainhand(bot, typeId);
   if (!consumeItem(bot, typeId, 1)) return false;
 
   const ok =
@@ -97,6 +104,7 @@ export function placeBlock(bot, pos, typeId, tracker) {
     }, false) ?? false;
 
   if (ok) {
+    playSwing(bot);
     tracker?.push({ x: pos.x, y: pos.y, z: pos.z, dimensionId: dim.id });
     safe(() => dim.playSound('use.stone', pos, { volume: 0.8 }));
   }

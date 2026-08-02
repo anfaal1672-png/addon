@@ -383,6 +383,62 @@ function archery(level, { ticks = 600, range = 20 } = {}) {
   };
 }
 
+/* ------------------------------------------------------------ desync test */
+
+/**
+ * Two identical bots fighting the same opponent must not act in lockstep. Running the same
+ * deterministic code from the same starting tick made them swing, strafe and jump on exactly
+ * the same ticks, so they moved as one object rendered twice.
+ */
+function twinSync(level = 5, ticks = 400) {
+  dimension.entities.length = 0;
+
+  const dummy = new FakeEntity('minecraft:player', { x: 0, y: GROUND_Y, z: 0 });
+  dummy.invincible = true;
+
+  const bots = [-4, 4].map((x) => {
+    const e = new FakeEntity('pvp:bot', { x, y: GROUND_Y, z: 0 });
+    applyKit(e, 'diamond');
+    return {
+      entity: e,
+      brain: new BotBrain(e, {
+        level,
+        kit: 'diamond',
+        home: { location: { x, y: GROUND_Y, z: 0 }, dimensionId: 'overworld' },
+      }),
+      swingTicks: new Set(),
+    };
+  });
+
+  // Mirror-image starting positions, so any divergence comes from the bots, not the setup.
+  const mirrorGaps = [];
+
+  for (let tick = 1; tick <= ticks; tick++) {
+    for (const bot of bots) {
+      const before = bot.entity.swings;
+      bot.brain.tick(tick);
+      if (bot.entity.swings > before) bot.swingTicks.add(tick);
+    }
+    for (const bot of bots) physics(bot.entity);
+    physics(dummy);
+
+    // Compare each bot against its own mirror image: identical behaviour would keep them
+    // exactly reflected about the dummy for the whole fight.
+    const [p0, p1] = bots.map((b) => b.entity.location);
+    mirrorGaps.push(Math.hypot(p0.x + p1.x, p0.z + p1.z));
+  }
+
+  const [a, b] = bots;
+  const shared = [...a.swingTicks].filter((t) => b.swingTicks.has(t)).length;
+  const total = Math.min(a.swingTicks.size, b.swingTicks.size);
+  return {
+    shared,
+    total,
+    overlap: total ? shared / total : 0,
+    mirrorDivergence: mirrorGaps.reduce((x, y) => x + y, 0) / mirrorGaps.length,
+  };
+}
+
 /* ---------------------------------------------------------------- reports */
 
 function table(title, rows) {
@@ -465,6 +521,20 @@ expect(
 expect(
   still[4].critRate > 0.6,
   `level 5 lands jump-crits on most hits (${(still[4].critRate * 100).toFixed(0)}%)`
+);
+
+const twins = twinSync();
+console.log(
+  `\nTwin bots: ${twins.shared}/${twins.total} swings on the same tick ` +
+    `(${(twins.overlap * 100).toFixed(0)}% overlap)`
+);
+expect(
+  twins.overlap < 0.6,
+  `two identical bots do not swing in lockstep (${(twins.overlap * 100).toFixed(0)}% of swings coincide)`
+);
+expect(
+  twins.mirrorDivergence > 1.5,
+  `two identical bots do not move as mirror images (${twins.mirrorDivergence.toFixed(2)} blocks average divergence)`
 );
 
 console.log('');

@@ -17,7 +17,7 @@ import {
   SHARPNESS_PER_LEVEL,
   WEAPON_DAMAGE,
 } from './config.js';
-import { getEquipment } from './kits.js';
+import { damageEquipment, getEquipment } from './kits.js';
 import { getSettings } from './state.js';
 import { V, chance, safe } from './util.js';
 
@@ -211,8 +211,16 @@ export function swing(attacker, target, { tick, missChance = 0, forceNoCrit = fa
     wtap,
   });
 
+  // Weapons wear out. The engine does not charge durability for script damage.
+  damageEquipment(attacker, EquipmentSlot.Mainhand, 1);
+
+  // Fire Aspect: the engine does not apply weapon enchantments to script damage, so a bot
+  // swinging a Fire Aspect sword would otherwise never set anything alight.
+  const fireAspect = enchantLevel(item, 'fire_aspect');
+  if (fireAspect > 0) safe(() => target.setOnFire(fireAspect * 4, true));
+
   safe(() =>
-    attacker.dimension.playSound(critical ? 'game.player.attack.strong' : 'game.player.attack.nodamage', target.location, {
+    attacker.dimension.playSound(critical ? 'game.player.attack.strong' : 'game.player.attack.weak', target.location, {
       volume: 0.9,
     })
   );

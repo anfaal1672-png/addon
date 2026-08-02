@@ -25,11 +25,16 @@
           "v.last_swing_id = -1.0;",
           "v.swing_start = -100.0;",
           "v.attack_time = -1.0;",
+          "v.attack_body_rot_y = 0.0;",
           "v.use_item_startup_progress = 0.0;",
-          "v.use_item_interval_progress = 0.0;"
+          "v.use_item_interval_progress = 0.0;",
+          "v.is_holding_right = 0.0;",
+          "v.is_holding_left = 0.0;",
+          "v.tcos0 = 0.0;",
+          "v.item_use_duration = 0.0;"
         ],
         "pre_animation": [
-          "v.tcos0 = Math.cos(query.modified_distance_moved * 38.17) * query.modified_move_speed / v.gliding_speed_value * 57.3;",
+          "v.tcos0 = (math.cos(query.modified_distance_moved * 38.17) * query.modified_move_speed / v.gliding_speed_value) * 57.3;",
           "v.riding_y_offset = query.is_riding_any_entity_of_type('minecraft:minecart', 'minecraft:boat', 'minecraft:chest_boat', 'minecraft:strider') ? -3.0 : 0.0;",
           "v.helmet_layer_visible = 1.0;",
           "v.leg_layer_visible = 1.0;",
@@ -39,20 +44,27 @@
           "(v.swing_id != v.last_swing_id) ? { v.last_swing_id = v.swing_id; v.swing_start = q.life_time; };",
           "v.swing_elapsed = q.life_time - v.swing_start;",
           "v.attack_time = (v.swing_elapsed >= 0.0 && v.swing_elapsed < 0.3) ? math.clamp(v.swing_elapsed / 0.3, 0.0, 1.0) : -1.0;",
+          "v.attack_body_rot_y = math.sin(360.0 * math.sqrt(math.max(v.attack_time, 0.0))) * 5.0;",
+          "v.is_holding_right = query.get_equipped_item_name != '' ? 1.0 : 0.0;",
+          "v.is_holding_left = 0.0;",
           "v.use_item_startup_progress = q.property('pvp:using') > 0 ? 1.0 : 0.0;",
           "v.use_item_interval_progress = 0.0;",
-          "v.item_use_duration = q.property('pvp:using') > 0 ? ((v.item_use_duration ?? 0.0) + query.delta_time * 20.0) : 0.0;",
+          "v.item_use_duration = q.property('pvp:using') > 0 ? (v.item_use_duration + query.delta_time * 20.0) : 0.0;",
           "v.item_use_normalized = math.clamp(v.item_use_duration / 32.0, 0.0, 1.0);"
         ],
         "variables": {
           "variable.item_use_normalized": "public",
           "variable.attack_time": "public",
+          "variable.attack_body_rot_y": "public",
           "variable.use_item_startup_progress": "public",
-          "variable.use_item_interval_progress": "public"
+          "variable.use_item_interval_progress": "public",
+          "variable.is_holding_right": "public",
+          "variable.is_holding_left": "public"
         },
         "animate": [
           "look_at_target_controller",
-          "move_controller",
+          { "move.arms": "!query.is_swimming" },
+          { "move.legs": "!query.is_swimming" },
           "riding_controller",
           "holding_controller",
           "brandish_spear_controller",
@@ -63,7 +75,8 @@
           "damage_nearby_mobs_controller",
           "bow_and_arrow_controller",
           "use_item_progress_controller",
-          "swimming_controller"
+          { "swimming": "query.is_swimming" },
+          { "swimming.legs": "query.is_swimming" }
         ],
         "should_update_effects_offscreen": "1.0"
       },
@@ -72,23 +85,26 @@
         "look_at_target_default": "animation.humanoid.look_at_target.default",
         "look_at_target_gliding": "animation.humanoid.look_at_target.gliding",
         "look_at_target_swimming": "animation.humanoid.look_at_target.swimming",
-        "move": "animation.humanoid.move",
-        "riding.arms": "animation.humanoid.riding.arms",
-        "riding.legs": "animation.humanoid.riding.legs",
+
+        "move.arms": "animation.player.move.arms",
+        "move.legs": "animation.player.move.legs",
+        "attack.rotations": "animation.player.attack.rotations",
+        "holding": "animation.player.holding",
+        "sneaking": "animation.player.sneaking",
+        "bob": "animation.player.bob",
+        "swimming": "animation.player.swim",
+        "swimming.legs": "animation.player.swim.legs",
+
+        "riding.arms": "animation.player.riding.arms",
+        "riding.legs": "animation.player.riding.legs",
         "riding.body": "animation.humanoid.riding.body",
-        "holding": "animation.humanoid.holding",
         "brandish_spear": "animation.humanoid.brandish_spear",
         "charging": "animation.humanoid.charging",
-        "attack.rotations": "animation.humanoid.attack.rotations",
-        "sneaking": "animation.humanoid.sneaking",
-        "bob": "animation.humanoid.bob",
         "damage_nearby_mobs": "animation.humanoid.damage_nearby_mobs",
         "bow_and_arrow": "animation.humanoid.bow_and_arrow",
         "use_item_progress": "animation.humanoid.use_item_progress",
-        "swimming": "animation.zombie.swimming",
 
         "look_at_target_controller": "controller.animation.humanoid.look_at_target",
-        "move_controller": "controller.animation.humanoid.move",
         "riding_controller": "controller.animation.humanoid.riding",
         "holding_controller": "controller.animation.humanoid.holding",
         "brandish_spear_controller": "controller.animation.humanoid.brandish_spear",
@@ -98,8 +114,7 @@
         "bob_controller": "controller.animation.humanoid.bob",
         "damage_nearby_mobs_controller": "controller.animation.humanoid.damage_nearby_mobs",
         "bow_and_arrow_controller": "controller.animation.humanoid.bow_and_arrow",
-        "use_item_progress_controller": "controller.animation.humanoid.use_item_progress",
-        "swimming_controller": "controller.animation.zombie.swimming"
+        "use_item_progress_controller": "controller.animation.humanoid.use_item_progress"
       },
 
       "render_controllers": ["controller.render.pvp_bot"],

@@ -5,11 +5,11 @@
 
 import { system, world } from '@minecraft/server';
 import { BotBrain } from './bot.js';
-import { applyKit } from './kits.js';
+import { ARMOUR_EQUIPMENT_SLOTS, applyKit, damageEquipment } from './kits.js';
 import { KITS } from './config.js';
 import { cleanupBlocks } from './blocks.js';
 import { getSettings, updateStats } from './state.js';
-import { V, clamp, isAlive, rotateXZ, safe } from './util.js';
+import { V, clamp, isAlive, randRange, rotateXZ, safe } from './util.js';
 
 export const BOT_TYPE = 'pvp:bot';
 
@@ -102,14 +102,21 @@ export function spawnBot({ dimension, location, level, kit, facing }) {
   applyKit(entity, kitId);
   persist(entity, { level, kit: kitId, home });
 
+  // Player nameplates are not depth tested and stay legible a long way off. A mob's default
+  // nameplate vanishes behind blocks and fades early, which reads wrong at a glance.
+  safe(() => {
+    entity.nameplateDepthTested = false;
+    entity.nameplateRenderDistance = 64;
+  });
+
   if (facing) safe(() => entity.lookAt(facing));
 
   const brain = new BotBrain(entity, { level, kit: kitId, home });
   brain.refreshName();
   brains.set(entity.id, brain);
 
-  safe(() => dimension.spawnParticle('minecraft:large_explosion', location));
-  safe(() => dimension.playSound('mob.zombie_villager.cure', location, { volume: 0.5, pitch: 1.6 }));
+  // No spawn effect on purpose. An explosion and a chime announce "this is a summoned mob"
+  // louder than anything else the bot does; a player joining a fight just appears.
   return brain;
 }
 
@@ -234,6 +241,18 @@ export function installEvents() {
       if (victim.typeId === BOT_TYPE) {
         const brain = brains.get(victim.id);
         brain?.onHurt(tick, attacker);
+        // A custom entity has no sound events of its own, so hitting the bot was silent.
+        // Played from script rather than declared in sounds.json, because that file is
+        // replace-not-merge on some builds and would take the vanilla sound table with it.
+        safe(() =>
+          victim.dimension.playSound('game.player.hurt', victim.location, {
+            volume: 1,
+            pitch: randRange(0.9, 1.1),
+          })
+        );
+        // Vanilla charges armour one point of durability per four damage taken, minimum one.
+        const wear = Math.max(1, Math.floor(amount / 4));
+        for (const slot of ARMOUR_EQUIPMENT_SLOTS) damageEquipment(victim, slot, wear);
         if (attacker?.typeId === 'minecraft:player') {
           updateStats(attacker.id, (s) => {
             s.damageDealt += amount;
@@ -267,6 +286,13 @@ export function installEvents() {
       }
 
       if (dead.typeId !== BOT_TYPE) return;
+
+      safe(() =>
+        dead.dimension.playSound('game.player.die', dead.location, {
+          volume: 1,
+          pitch: randRange(0.9, 1.1),
+        })
+      );
 
       const brain = brains.get(dead.id);
       brains.delete(dead.id);

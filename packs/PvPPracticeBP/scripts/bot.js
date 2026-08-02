@@ -25,8 +25,8 @@ import {
   mlgWater,
   towerUp,
 } from './blocks.js';
-import { hasItem, switchMainhand } from './kits.js';
-import { USING_BOW, USING_ITEM, USING_NONE, setUsing } from './anim.js';
+import { consumeHeldItem, hasItem, switchMainhand } from './kits.js';
+import { USING_BOW, USING_ITEM, USING_NONE, playSwing, setUsing } from './anim.js';
 import {
   combatVelocity,
   driveHorizontal,
@@ -85,10 +85,27 @@ export class BotBrain {
     /** @type {import('@minecraft/server').Entity | undefined} */
     this.target = undefined;
     this.perceived = undefined;
-    this.lastPerceptionTick = -999;
-    this.lastTargetScan = -999;
+    // Every timer gets a random phase.
+    //
+    // Two bots created on the same tick, running identical code, otherwise decide identical
+    // things on identical ticks forever: they swing in unison, flip strafe direction in
+    // unison and read as one entity rendered twice. Real opponents are never in phase.
+    this.phase = randInt(0, 19);
 
-    this.lastSwingTick = -999;
+    this.lastPerceptionTick = -999 + this.phase;
+
+    this.lastSwingTick = -999 + this.phase;
+    this.lastAirSwing = -999 + this.phase;
+    this.airSwingInterval = randInt(2, 5);
+    /**
+     * How many ticks past the end of the target's invulnerability this bot actually swings.
+     *
+     * Even a frame-perfect player feels the window rather than reading it. Without this every
+     * bot fighting the same opponent swings on precisely the same tick, so two of them move
+     * as one object rendered twice.
+     */
+    this.swingBias = randInt(0, 2);
+    this.lastTargetScan = -999 + this.phase;
     this.critWaitUntil = 0;
     this.sprintPauseUntil = 0;
     this.comboUntil = 0;
@@ -184,6 +201,11 @@ export class BotBrain {
 
   tick(tick) {
     if (!isAlive(this.entity)) return false;
+
+    // Finishing a meal is not conditional on still having an opponent. Driving this from
+    // act() meant a bot that killed or lost its target mid-bite stayed frozen holding an
+    // apple, and never swapped its weapon back.
+    if (this.eatingItem && tick >= this.eatingUntil) this.finishEating(tick);
 
     this.acquireTarget(tick);
 
@@ -316,13 +338,22 @@ export class BotBrain {
   faceBody(moveDir, moving) {
     const aimYaw = this.aimYaw ?? this.bodyYaw;
     let wantYaw = aimYaw;
+
     if (moving && (moveDir.x !== 0 || moveDir.z !== 0)) {
       wantYaw = directionToRotation({ x: moveDir.x, y: 0, z: moveDir.z }).y;
-      // A head can only twist so far off the shoulders; past that the body follows.
-      const off = angleDelta(wantYaw, aimYaw);
-      if (Math.abs(off) > 50) wantYaw = aimYaw - Math.sign(off) * 50;
+
+      // A head can only twist so far off the shoulders; past that the body follows. The clamp
+      // is skipped while disengaging, because holding it there is exactly what produced the
+      // backwards-shuffle: the body stayed pointed at the opponent while the bot ran away.
+      if (!this.disengaging) {
+        const off = angleDelta(wantYaw, aimYaw);
+        if (Math.abs(off) > 50) wantYaw = aimYaw - Math.sign(off) * 50;
+      }
     }
-    this.bodyYaw = approachAngle(this.bodyYaw, wantYaw, 22);
+
+    // Turning while sprinting away is quicker than a shoulder check.
+    const turnRate = this.disengaging ? 40 : 22;
+    this.bodyYaw = approachAngle(this.bodyYaw, wantYaw, turnRate);
     setBodyRotation(this.entity, this.bodyYaw, this.aimPitch ?? 0);
   }
 
@@ -389,8 +420,12 @@ export class BotBrain {
     // bot that idles at its preferred range simply gets walked out of reach.
     else approach = 0.5;
 
-    const retreating = tick < (this.retreatUntil ?? 0) && p.retreatSkill > 0.3;
-    if (retreating) approach = -1;
+    // Disengaging is not the same as backing off a step. Small spacing adjustments are made
+    // walking backwards while watching the opponent, but a real retreat means turning round
+    // and sprinting, so `disengaging` unlocks both the sprint and the full body turn.
+    const disengaging = tick < (this.retreatUntil ?? 0) && p.retreatSkill > 0.3;
+    if (disengaging) approach = -1;
+    this.disengaging = disengaging;
 
     // Circle strafing: the sign flips on a timer that gets tighter with skill.
     if (tick > this.strafeUntil) {
@@ -446,10 +481,11 @@ export class BotBrain {
 
     const sprinting =
       tick > this.sprintPauseUntil &&
-      dist > 1.4 &&
-      approach > 0 &&
+      p.sprintSkill > 0.05 &&
       chance(0.6 + 0.4 * p.sprintSkill) &&
-      p.sprintSkill > 0.05;
+      // Sprinting away is just as much a thing as sprinting in - a bot that only ever
+      // sprints towards you crawls backwards whenever it wants distance.
+      ((approach > 0 && dist > 1.4) || disengaging);
     this.sprinting = sprinting;
     this.closing = approach > 0.5;
 
@@ -563,10 +599,22 @@ export class BotBrain {
 
     if (!inRange) {
       this.critWaitUntil = 0;
+      // Bedrock has no attack cooldown, so players spam-click the whole fight - including
+      // while closing the gap. A bot whose arm only moves when a hit is guaranteed to land
+      // telegraphs its exact reach.
+      // The interval is re-rolled every swing. Nobody clicks on a perfectly fixed period,
+      // and a fixed period is also what made two bots spam in perfect unison.
+      if (dist < 6 && tick - this.lastAirSwing >= this.airSwingInterval) {
+        this.lastAirSwing = tick;
+        this.airSwingInterval = Math.max(2, Math.round(20 / p.cps)) + randInt(0, 3);
+        playSwing(this.entity);
+      }
       return;
     }
 
-    const interval = Math.max(1, Math.round(20 / p.cps));
+    // A little jitter on the interval: perfectly periodic clicking is machine-like, and two
+    // bots on the same cadence attack in lockstep.
+    const interval = Math.max(1, Math.round(20 / p.cps) + (chance(0.35 * p.jitter + 0.15) ? 1 : 0));
     if (tick - this.lastSwingTick < interval) return;
 
     // A player cannot hit through a wall, so neither can the bot. Checked before the swing
@@ -582,7 +630,7 @@ export class BotBrain {
       // A jump is already set up: hold the swing until the fall starts, which is what
       // turns it into a 1.5x critical rather than a wasted hop.
       if (!isCriticalPosition(this.entity)) return;
-    } else if (since < IFRAME_TICKS) {
+    } else if (since < IFRAME_TICKS + this.swingBias) {
       // The target is invulnerable. A good bot spends the window setting up the next
       // jump-crit so that the apex lines up with the moment invulnerability ends;
       // a bad bot just mashes through it for nothing.
@@ -606,6 +654,9 @@ export class BotBrain {
 
     this.lastSwingTick = tick;
     this.critWaitUntil = 0;
+    // Re-roll the human timing error for the next exchange. Two ticks is about 100 ms, which
+    // is roughly the spread a real player has even when they know the window exactly.
+    this.swingBias = randInt(0, 2 + Math.round(2 * p.jitter));
     const result = swing(this.entity, this.target, {
       tick,
       missChance: 1 - hitChance,
@@ -649,7 +700,9 @@ export class BotBrain {
       approach,
       strafe: this.strafeSign * p.strafe * 0.8,
       sprinting: false,
-      speedScale: 0.85,
+      // Drawing a bow slows a player to a crawl. Gliding around at nearly full speed with
+      // the bow pulled back is not something a player can do.
+      speedScale: this.bow.charging ? 0.3 : 0.9,
     });
     stepWithTerrain(this.entity, vel, { sprinting: false, airControl: p.kbControl });
     this.faceBody(vel.dir, V.lengthXZ(vel) > 0.02);
@@ -706,7 +759,7 @@ export class BotBrain {
         approach: -1,
         strafe: this.strafeSign * p.strafe * 0.5,
         sprinting: false,
-        speedScale: 0.65,
+        speedScale: 0.3,
       });
       stepWithTerrain(this.entity, vel, { sprinting: false, airControl: p.kbControl });
       this.faceBody(vel.dir, true);
@@ -748,8 +801,9 @@ export class BotBrain {
     setUsing(this.entity, USING_NONE);
 
     // The apple is only spent once the animation actually finished - interrupt it and the
-    // bot keeps the apple, same as a player.
-    if (!consumeItem(this.entity, item, 1)) {
+    // bot keeps the apple, same as a player. It is eaten out of the hand, falling back to
+    // the inventory only if the hand somehow no longer holds it.
+    if (!consumeHeldItem(this.entity, item, 1) && !consumeItem(this.entity, item, 1)) {
       this.restoreHand();
       return;
     }
@@ -771,9 +825,13 @@ export class BotBrain {
   }
 
   restoreHand() {
-    const back = this.eatingSwapBack ?? this.preferredMelee();
+    const saved = this.eatingSwapBack;
     this.eatingSwapBack = undefined;
-    if (back) switchMainhand(this.entity, back);
+    // Prefer whatever was in hand before the meal, but fall back to any weapon still in the
+    // bag - the saved item may have been the last of its kind, or may never have existed.
+    if (saved && switchMainhand(this.entity, saved)) return;
+    const melee = this.preferredMelee();
+    if (melee) switchMainhand(this.entity, melee);
   }
 
   /**

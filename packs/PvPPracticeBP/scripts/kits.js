@@ -163,19 +163,92 @@ export function switchMainhand(bot, typeId) {
       for (let i = 0; i < container.size; i++) {
         const stack = container.getItem(i);
         if (stack?.typeId !== typeId) continue;
-        // Swap: what is in hand goes into the slot the new item came from.
-        container.setItem(i, current);
+
+        // Swap: what is in hand goes into the slot the new item came from. When the hand is
+        // empty `current` is undefined, and writing that into the slot would destroy the
+        // item we are about to pick up - so clear the slot only once the swap succeeded.
         if (comp) {
           comp.setEquipment(EquipmentSlot.Mainhand, stack);
         } else {
           bot.runCommand(`replaceitem entity @s slot.weapon.mainhand 0 ${stack.typeId} ${stack.amount}`);
         }
+        container.setItem(i, current);
         return true;
       }
       return false;
     }, false) ?? false
   );
 }
+
+/**
+ * Consumes from the *main hand* rather than the inventory.
+ *
+ * Eating works on the item you are holding. Draining the inventory instead silently failed
+ * whenever the last golden apple was the one in the bot's hand - it ate, got nothing, and
+ * kept holding the apple.
+ */
+export function consumeHeldItem(bot, typeId, amount = 1) {
+  return (
+    safe(() => {
+      const comp = equippable(bot);
+      if (!comp) return false;
+      const stack = comp.getEquipment(EquipmentSlot.Mainhand);
+      if (stack?.typeId !== typeId) return false;
+
+      if (stack.amount <= amount) {
+        comp.setEquipment(EquipmentSlot.Mainhand, undefined);
+      } else {
+        stack.amount -= amount;
+        comp.setEquipment(EquipmentSlot.Mainhand, stack);
+      }
+      return true;
+    }, false) ?? false
+  );
+}
+
+/**
+ * Wears down one equipment slot, breaking the item when it runs out.
+ *
+ * Nothing in the engine applies durability to script-driven combat, so the bot's gear used
+ * to last forever - a netherite bot could grind through a hundred fights on one sword while
+ * the player it is copying would have watched theirs shatter.
+ */
+export function damageEquipment(bot, slot, amount = 1) {
+  return (
+    safe(() => {
+      const comp = equippable(bot);
+      const stack = comp?.getEquipment(slot);
+      if (!stack) return false;
+
+      const durability = stack.getComponent('minecraft:durability');
+      if (!durability) return false;
+
+      // Unbreaking: each level gives a chance to skip the wear entirely.
+      let applied = 0;
+      const unbreaking = safe(() => {
+        const e = stack.getComponent('minecraft:enchantable')?.getEnchantment('unbreaking');
+        return e ? e.level : 0;
+      }, 0) ?? 0;
+      for (let i = 0; i < amount; i++) {
+        if (unbreaking > 0 && Math.random() < unbreaking / (unbreaking + 1)) continue;
+        applied++;
+      }
+      if (applied === 0) return false;
+
+      const next = durability.damage + applied;
+      if (next >= durability.maxDurability) {
+        comp.setEquipment(slot, undefined);
+        safe(() => bot.dimension.playSound('random.break', bot.location, { volume: 0.8 }));
+        return true;
+      }
+      durability.damage = next;
+      comp.setEquipment(slot, stack);
+      return true;
+    }, false) ?? false
+  );
+}
+
+export const ARMOUR_EQUIPMENT_SLOTS = ARMOUR_SLOTS;
 
 /** True if the bot is carrying, or already holding, an item of this type. */
 export function hasItem(bot, typeId) {

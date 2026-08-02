@@ -201,9 +201,25 @@ export function stepWithTerrain(entity, velocity, { sprinting, allowFall = false
     jumped = jump(entity, { sprinting: true, forward: dir });
   } else if (probe.wall) {
     blocked = true;
+    // Two blocks tall or more: jumping will not clear it, so go round. Whichever side is
+    // open gets picked; without this the bot walks into a wall and stays there, which is
+    // what happens the moment an opponent blocks it off.
+    const side = { x: -dir.z, z: dir.x };
+    const speed = moveSpeed(sprinting);
+    const left = probeAhead(entity, side, 1.1);
+    const right = probeAhead(entity, { x: -side.x, z: -side.z }, 1.1);
+    const open = !left.wall && left.gap < 3 ? side : !right.wall && right.gap < 3 ? { x: -side.x, z: -side.z } : undefined;
+
+    if (open) {
+      // Slide along the wall, keeping a little forward lean so it hugs the corner.
+      driveHorizontal(entity, (open.x * 0.9 + dir.x * 0.3) * speed, (open.z * 0.9 + dir.z * 0.3) * speed, {
+        airControl,
+      });
+      return { blocked, gap: probe.gap, hazard: probe.hazard, jumped: false, detour: true };
+    }
     jumped = jump(entity, { sprinting, forward: dir });
   }
 
   driveHorizontal(entity, velocity.x, velocity.z, { airControl });
-  return { blocked, gap: probe.gap, hazard: probe.hazard, jumped };
+  return { blocked, gap: probe.gap, hazard: probe.hazard, jumped, detour: false };
 }

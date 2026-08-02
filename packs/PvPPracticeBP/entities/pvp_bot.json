@@ -104,17 +104,27 @@
           {
             "filters": { "test": "is_family", "subject": "other", "value": "player" },
             "max_dist": 32
+          },
+          {
+            "filters": { "test": "is_family", "subject": "other", "value": "pvp_bot" },
+            "max_dist": 32
           }
         ]
       },
 
-      "minecraft:behavior.look_at_player": {
+      "minecraft:behavior.look_at_target": {
         "priority": 8,
         "look_distance": 32.0,
         "angle_of_view_horizontal": 360,
         "angle_of_view_vertical": 360,
         "probability": 1.0,
         "look_time": [4.0, 8.0]
+      },
+
+      "minecraft:behavior.random_look_around": {
+        "priority": 9,
+        "look_distance": 8.0,
+        "look_time": [1.0, 4.0]
       }
     }
   }
