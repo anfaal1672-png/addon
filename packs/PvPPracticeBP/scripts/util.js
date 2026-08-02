@@ -3,8 +3,6 @@
  * Everything here is pure and side-effect free so it is cheap to call every tick.
  */
 
-export const TPS = 20;
-
 /* ------------------------------------------------------------------ random */
 
 let seed = 0x9e3779b9;
@@ -19,10 +17,6 @@ export function rand() {
 
 export function randRange(min, max) {
   return min + rand() * (max - min);
-}
-
-export function randInt(min, max) {
-  return Math.floor(randRange(min, max + 1));
 }
 
 /** Roughly normal-distributed noise in [-1, 1], used for aim error. */
@@ -68,18 +62,10 @@ export function makeRng(seedText) {
   };
 }
 
-export function pick(list) {
-  return list[Math.min(list.length - 1, Math.floor(rand() * list.length))];
-}
-
 /* ------------------------------------------------------------------ scalar */
 
 export function clamp(v, min, max) {
   return v < min ? min : v > max ? max : v;
-}
-
-export function lerp(a, b, t) {
-  return a + (b - a) * t;
 }
 
 /** Shortest signed difference between two angles, in degrees. */
@@ -118,18 +104,6 @@ export const V = {
   floor: (a) => ({ x: Math.floor(a.x), y: Math.floor(a.y), z: Math.floor(a.z) }),
 };
 
-/** Converts a Minecraft yaw/pitch pair (degrees) into a unit direction vector. */
-export function rotationToDirection(rot) {
-  const yaw = (rot.y * Math.PI) / 180;
-  const pitch = (rot.x * Math.PI) / 180;
-  const cosPitch = Math.cos(pitch);
-  return {
-    x: -Math.sin(yaw) * cosPitch,
-    y: -Math.sin(pitch),
-    z: Math.cos(yaw) * cosPitch,
-  };
-}
-
 /** Converts a direction vector into a Minecraft yaw/pitch pair (degrees). */
 export function directionToRotation(dir) {
   const n = V.normalize(dir);
@@ -148,11 +122,34 @@ export function rotateXZ(vec, deg) {
 
 /* ------------------------------------------------------------------ safety */
 
+/**
+ * Errors `safe()` has swallowed, newest last, deduplicated by message.
+ *
+ * Swallowing is necessary - entities go invalid mid-tick and that is not an error - but
+ * swallowing *silently* is how every bug in this add-on managed to ship: the symptom was
+ * always "it just does not do the thing", with nothing anywhere to say why. Counting them
+ * turns a silent failure into a number that `!pvp diag` and the test suite can both see.
+ */
+const suppressed = new Map();
+let suppressedCount = 0;
+
+export function suppressedErrors() {
+  return { total: suppressedCount, byMessage: [...suppressed.entries()].sort((a, b) => b[1] - a[1]) };
+}
+
+export function clearSuppressedErrors() {
+  suppressed.clear();
+  suppressedCount = 0;
+}
+
 /** Runs `fn`, swallowing the "entity no longer valid" style errors that are normal in a tick loop. */
 export function safe(fn, fallback = undefined) {
   try {
     return fn();
-  } catch {
+  } catch (err) {
+    const key = String(err?.message ?? err).slice(0, 120);
+    suppressed.set(key, (suppressed.get(key) ?? 0) + 1);
+    suppressedCount++;
     return fallback;
   }
 }

@@ -13,8 +13,6 @@
 export const WALK_SPEED = 0.2159;
 /** Bedrock sprint speed in blocks/tick (5.612 m/s). */
 export const SPRINT_SPEED = 0.2806;
-/** Bedrock sneak speed in blocks/tick. */
-export const SNEAK_SPEED = 0.0648;
 /** Vanilla jump impulse. */
 export const JUMP_POWER = 0.42;
 /** Extra forward velocity a sprint-jump carries in vanilla. */

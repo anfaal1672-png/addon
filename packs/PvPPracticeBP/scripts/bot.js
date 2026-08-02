@@ -49,6 +49,7 @@ import {
   directionToRotation,
   isAlive,
   makeRng,
+  rotateXZ,
   safe,
 } from './util.js';
 
@@ -131,6 +132,8 @@ export class BotBrain {
 
     this.strafeSign = this.rng.sign();
     this.strafeUntil = 0;
+    this.wanderAngle = 0;
+    this.wanderUntil = 0;
     this.aimNoise = { x: 0, y: 0 };
     this.aimNoiseUntil = 0;
     this.threat = undefined;
@@ -571,12 +574,23 @@ export class BotBrain {
     if (p.dodgeSkill > 0.05) {
       if (tick - this.lastThreatScan >= 3) {
         this.lastThreatScan = tick;
-        this.threat = incomingThreat(this.entity, 14);
+        const found = incomingThreat(this.entity, 14);
+        if (found && found.entity?.id !== this.threat?.entity?.id) {
+          // Roll the reaction once, when this projectile is first seen. Re-rolling it every
+          // tick let the bot keep trying until a low sample came up, so nothing was ever
+          // really too fast to dodge.
+          found.noticeAt = tick + Math.round(this.human.decisionLatency(tick));
+          this.threat = found;
+        } else if (found && this.threat) {
+          this.threat = { ...found, noticeAt: this.threat.noticeAt };
+        } else {
+          this.threat = found;
+        }
       }
       const threat = this.threat;
-      // A projectile that arrives faster than the bot's reaction time cannot be dodged, which
+      // A projectile that lands before the bot has finished reacting cannot be dodged, which
       // is why point-blank arrows hit and long-range ones do not.
-      const canSee = threat && threat.ticks >= Math.round(this.human.decisionLatency(tick));
+      const canSee = threat && tick >= (threat.noticeAt ?? Infinity);
       if (canSee && isAlive(threat.entity) && this.rng.chance(p.dodgeSkill)) {
         strafe = 0;
         const dodge = threat.dodge;
@@ -626,7 +640,19 @@ export class BotBrain {
       }
     }
 
-    const vel = combatVelocity({ toTarget: flat, approach, strafe, sprinting, speedScale });
+    let vel = combatVelocity({ toTarget: flat, approach, strafe, sprinting, speedScale });
+
+    // Nobody holds a perfectly straight line. A slowly wandering heading error, largest at low
+    // skill, is what stops a beginner from walking at you like a rail-guided trolley - and it
+    // was the reason two level 1 bots stayed exact mirror images of each other all fight.
+    if (tick > this.wanderUntil) {
+      this.wanderAngle = this.rng.range(-1, 1) * 35 * p.jitter;
+      this.wanderUntil = tick + this.rng.int(10, 30);
+    }
+    if (this.wanderAngle !== 0) {
+      const turned = rotateXZ(vel, this.wanderAngle);
+      vel = { x: turned.x, z: turned.z, dir: V.normalizeXZ(turned) };
+    }
     // Knockback control is real air-strafing now, not a fake speed bonus: a bot with low
     // kbControl barely steers while airborne, so it takes the full ride from every hit.
     const terrain = stepWithTerrain(this.entity, vel, {
@@ -761,8 +787,9 @@ export class BotBrain {
       }
       if (disciplined) return;
     } else if (canCrit && onGround && this.rng.chance(p.critSkill)) {
-      // Opening hit of an exchange: hop first, connect on the way down.
-      jump(this.entity);
+      // Opening hit of an exchange: hop first, connect on the way down. Same aimed run-up as
+      // the in-combo case, otherwise this one sails off whatever tangent the strafe was on.
+      this.critJump();
       this.critWaitUntil = tick + 8;
       return;
     }
@@ -782,6 +809,7 @@ export class BotBrain {
       missChance: 1 - hitChance,
       wtap: p.wtapSkill,
       sprinting: this.sprinting,
+      rng: this.rng,
     });
 
     if (result === 'hit') {

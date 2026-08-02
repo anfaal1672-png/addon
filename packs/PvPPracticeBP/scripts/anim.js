@@ -20,9 +20,6 @@ export const USING_NONE = 0;
 export const USING_ITEM = 1;
 export const USING_BOW = 2;
 
-/** How long the client plays the swing for, in ticks. Matches the 0.3 s in pre_animation. */
-export const SWING_TICKS = 6;
-
 let probed = false;
 
 function probe(entity) {

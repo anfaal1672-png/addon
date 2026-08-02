@@ -19,7 +19,7 @@ import {
   spawnBotsNear,
 } from './manager.js';
 import { openHelp, openMenu, openStats, requireNearestBrain } from './ui.js';
-import { clamp, safe } from './util.js';
+import { clamp, safe, suppressedErrors } from './util.js';
 
 const PREFIX = '!pvp';
 
@@ -72,6 +72,17 @@ function cmdKit(player, args) {
  */
 function cmdDiag(player) {
   const lines = ['§l=== PvP Practice diagnostics ===§r', diagnostics.report()];
+
+  const errors = suppressedErrors();
+  lines.push(
+    errors.total === 0
+      ? '§asuppressed errors§r none'
+      : `§csuppressed errors§r ${errors.total} - ` +
+          errors.byMessage
+            .slice(0, 3)
+            .map(([msg, n]) => `${msg} (x${n})`)
+            .join('; ')
+  );
 
   const brain = nearestBrain(player, 32);
   if (!brain) {

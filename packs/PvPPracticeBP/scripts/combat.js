@@ -50,10 +50,6 @@ export function getHeldItem(entity) {
   return getHeldStack(entity);
 }
 
-export function getOffhandItem(entity) {
-  return getEquipment(entity, EquipmentSlot.Offhand);
-}
-
 export function enchantLevel(item, enchantId) {
   if (!item) return 0;
   return (
@@ -181,13 +177,14 @@ export function applyKnockbackCompat(entity, x, z, vertical) {
  *
  * @returns {'hit'|'iframe'|'miss'|'blocked'}
  */
-export function swing(attacker, target, { tick, missChance = 0, forceNoCrit = false, wtap = 0, sprinting = false }) {
+export function swing(attacker, target, { tick, missChance = 0, forceNoCrit = false, wtap = 0, sprinting = false, rng }) {
   // Always swing the arm, then work out what the swing hit.
   playSwing(attacker);
 
   if (isInvulnerable(target.id, tick)) return 'iframe';
   if (!hasLineOfSight(attacker, target)) return 'blocked';
-  if (missChance > 0 && chance(missChance)) return 'miss';
+  // Rolled on the attacker's own stream, so two bots swinging at once miss independently.
+  if (missChance > 0 && (rng ? rng.chance(missChance) : chance(missChance))) return 'miss';
 
   const item = getHeldItem(attacker);
   const critical = !forceNoCrit && isCriticalPosition(attacker);

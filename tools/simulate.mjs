@@ -17,10 +17,14 @@ const load = (name) => import(pathToFileURL(join(scripts, name)).href);
 
 const { BotBrain } = await load('bot.js');
 const { applyKit } = await load('kits.js');
-const { ARROW_SPEED, IFRAME_TICKS } = await load('config.js');
+const { ARROW_SPEED, IFRAME_TICKS, LEVELS } = await load('config.js');
 const { PLACE_COOLDOWN, placeBlock } = await load('blocks.js');
 const { consumeHeldItem, switchMainhand } = await load('kits.js');
 const { jump } = await load('movement.js');
+const { clearSuppressedErrors, suppressedErrors } = await load('util.js');
+const manager = await load('manager.js');
+const { getStats } = await load('state.js');
+const { system, world } = await import('@minecraft/server');
 
 /* ------------------------------------------------------------- fake world */
 
@@ -43,10 +47,15 @@ const dimension = {
   getBlockFromRay() {
     return undefined;
   },
-  getEntities({ location, maxDistance }) {
+  // Supports the same option shapes the add-on actually uses: a radius query, and a
+  // type-only query with no location at all (removeAllBots and rescanWorld use the latter).
+  getEntities(options = {}) {
+    const { location, maxDistance, type } = options;
     return this.entities
       .filter((e) => {
         if (!e.isValid) return false;
+        if (type && e.typeId !== type) return false;
+        if (!location || maxDistance === undefined) return true;
         const d = Math.hypot(e.location.x - location.x, e.location.y - location.y, e.location.z - location.z);
         return d <= maxDistance;
       })
@@ -57,6 +66,8 @@ const dimension = {
   },
   shots: [],
   spawnEntity(typeId, location) {
+    // Real spawning, so the manager's own spawn path can be exercised end to end.
+    if (typeId === 'pvp:bot') return wrapEntity(new FakeEntity('pvp:bot', location));
     if (typeId !== 'minecraft:arrow') return undefined;
     const record = { location: { ...location }, velocity: undefined };
     this.shots.push(record);
@@ -569,6 +580,132 @@ function reactionTest(level, { settle = 80, samples = 24 } = {}) {
   };
 }
 
+/* ------------------------------------------------------------- lifecycle */
+
+/**
+ * The whole entity lifecycle through the add-on's own event handlers.
+ *
+ * Spawning, hurting, dying, respawning, statistics and block clean-up are all wired to
+ * world events, and none of that had ever been executed by a test - only the tick loop had.
+ */
+function lifecycle() {
+  dimension.entities.length = 0;
+  clearSuppressedErrors();
+  world.dimensions.set('overworld', dimension);
+  system.timeouts.length = 0;
+
+  manager.installEvents();
+
+  // A player to summon from and fight with.
+  const player = new FakeEntity('minecraft:player', { x: 0, y: GROUND_Y, z: 0 });
+  player.invincible = true;
+  player.getGameMode = () => 'survival';
+  player.sendMessage = () => {};
+
+  const made = manager.spawnBotsNear(player, { level: 4, kit: 'diamond', count: 2, distance: 5 });
+  const brains = manager.listBrains();
+  const bot = brains[0];
+
+  // Armour must have been applied through the manager's own spawn path, not just applyKit.
+  const helmet = bot?.entity.equipment.get('Head')?.typeId;
+
+  // Hurt it: statistics, tilt and the hurt sound all hang off this event.
+  world.afterEvents.entityHurt.dispatch({
+    hurtEntity: bot.entity,
+    damageSource: { damagingEntity: player },
+    damage: 5,
+  });
+  const statsAfterHit = { ...getStats(player.id) };
+
+  // Give it a placed block so clean-up has something to do.
+  bot.placed.push({ x: 5, y: GROUND_Y, z: 5, dimensionId: 'overworld' });
+
+  // Kill it.
+  bot.entity.isValid = false;
+  world.afterEvents.entityDie.dispatch({
+    deadEntity: bot.entity,
+    damageSource: { damagingEntity: player },
+  });
+  const statsAfterKill = { ...getStats(player.id) };
+  const brainsAfterDeath = manager.listBrains().length;
+  const blocksLeft = bot.placed.length;
+
+  // The respawn is scheduled, not immediate.
+  const scheduled = system.timeouts.length;
+  system.flushTimeouts();
+  const brainsAfterRespawn = manager.listBrains().length;
+
+  const removed = manager.removeAllBots();
+
+  return {
+    made,
+    helmet,
+    damageDealt: statsAfterHit.damageDealt,
+    hits: statsAfterHit.hits,
+    botKills: statsAfterKill.botKills,
+    brainsAfterDeath,
+    blocksLeft,
+    scheduled,
+    brainsAfterRespawn,
+    removed,
+    remaining: manager.listBrains().length,
+    errors: suppressedErrors(),
+  };
+}
+
+/* ----------------------------------------------------------- full fight */
+
+/**
+ * A long fight with everything switched on, asserting that nothing threw.
+ *
+ * `safe()` swallows exceptions on purpose - entities go invalid mid-tick and that is normal -
+ * but silent swallowing is how every bug so far managed to ship looking like "it just does
+ * not do the thing". Now that suppressed errors are counted, a clean run is something the
+ * suite can actually require.
+ */
+function fullFight({ level = 5, kit = 'uhc', ticks = 1200 } = {}) {
+  dimension.entities.length = 0;
+  clearSuppressedErrors();
+
+  const bot = new FakeEntity('pvp:bot', { x: 0, y: GROUND_Y, z: 0 });
+  applyKit(bot, kit);
+  const brain = new BotBrain(bot, {
+    level,
+    kit,
+    home: { location: { x: 0, y: GROUND_Y, z: 0 }, dimensionId: 'overworld' },
+  });
+
+  const dummy = new FakeEntity('minecraft:player', { x: 10, y: GROUND_Y, z: 0 });
+  dummy.invincible = true;
+
+  let hurtBot = 0;
+  for (let tick = 1; tick <= ticks; tick++) {
+    brain.tick(tick);
+
+    // The opponent fights back: circling, and landing a hit every so often so the bot has to
+    // heal, tilt, retreat and clutch rather than just walking forward for a minute.
+    dummy.velocity.x = Math.cos(tick / 15) * 0.2159;
+    dummy.velocity.z = -Math.sin(tick / 15) * 0.2159;
+    if (tick % 40 === 0) {
+      bot.applyDamage(4);
+      brain.onHurt(tick, dummy);
+      hurtBot++;
+    }
+    // Keep it alive so the whole run is exercised.
+    if (bot._health < 6) bot._health = 20;
+
+    physics(bot);
+    physics(dummy);
+  }
+
+  return {
+    hurtBot,
+    swings: bot.swings,
+    placed: brain.placed.length,
+    errors: suppressedErrors(),
+  };
+}
+
 /* ------------------------------------------- equipment without a component */
 
 /**
@@ -760,22 +897,52 @@ expect(
 
 // Every level, not just one: the first version of this only checked level 5, and the result
 // turned out to depend on how many numbers the rest of the suite had drawn beforehand.
-const twinsByLevel = [1, 2, 3, 4, 5].map((l) => ({ level: l, ...twinSync(l) }));
+// Averaged over several independent pairs. A single pair is a single pair of random seeds,
+// and measuring one of those told us more about the seed than about the bots - the same code
+// scored 22% in isolation and 91% inside the suite purely because entity ids differed.
+const twinsByLevel = [1, 2, 3, 4, 5].map((level) => {
+  const trials = Array.from({ length: 6 }, () => twinSync(level));
+  const mean = (pick) => trials.reduce((a, t) => a + pick(t), 0) / trials.length;
+  return {
+    level,
+    shared: Math.round(mean((t) => t.shared)),
+    total: Math.round(mean((t) => t.total)),
+    overlap: mean((t) => t.overlap),
+    worstOverlap: Math.max(...trials.map((t) => t.overlap)),
+    mirrorDivergence: mean((t) => t.mirrorDivergence),
+  };
+});
 console.log('\nTwin bots on one opponent (identical level, identical start)');
 console.log('  Lv   same-tick swings  divergence');
 for (const t of twinsByLevel) {
   console.log(
     `  ${t.level}   ${String(t.shared).padStart(3)}/${String(t.total).padEnd(3)} ` +
-      `${((t.overlap * 100).toFixed(0) + '%').padStart(9)}  ${t.mirrorDivergence.toFixed(2)} blocks`
+      `${((t.overlap * 100).toFixed(0) + '%').padStart(9)} (worst ${(t.worstOverlap * 100).toFixed(0)}%)  ` +
+      `${t.mirrorDivergence.toFixed(2)} blocks`
   );
 }
 expect(
-  twinsByLevel.every((t) => t.overlap < 0.6),
-  `no level fights in lockstep (worst ${(Math.max(...twinsByLevel.map((t) => t.overlap)) * 100).toFixed(0)}%)`
+  twinsByLevel.every((t) => t.overlap < 0.5),
+  `no level fights in lockstep on average (worst ${(Math.max(
+    ...twinsByLevel.map((t) => t.overlap)
+  ) * 100).toFixed(0)}%)`
 );
 expect(
-  twinsByLevel.every((t) => t.mirrorDivergence > 1.5),
-  `no level moves as a mirror image (worst ${Math.min(...twinsByLevel.map((t) => t.mirrorDivergence)).toFixed(2)} blocks)`
+  twinsByLevel.every((t) => t.worstOverlap < 0.85),
+  `not even the unluckiest pairing is fully in lockstep (worst ${(Math.max(
+    ...twinsByLevel.map((t) => t.worstOverlap)
+  ) * 100).toFixed(0)}%)`
+);
+// Only asserted for the levels that circle-strafe. A bot with no strafing walks straight at
+// its opponent and stands there, so two of them ending up in the same place is the correct
+// behaviour rather than a symptom - and in game they would shove each other apart anyway,
+// which this harness does not model.
+const strafers = twinsByLevel.filter((t) => LEVELS[t.level - 1].strafe > 0);
+expect(
+  strafers.every((t) => t.mirrorDivergence > 1.5),
+  `strafing levels do not move as mirror images (worst ${Math.min(
+    ...strafers.map((t) => t.mirrorDivergence)
+  ).toFixed(2)} blocks)`
 );
 
 const jumpResult = jumpHeight();
@@ -818,6 +985,45 @@ expect(
   reactions[4].meanMs > 80,
   `even the best level is not superhuman (${Math.round(reactions[4].meanMs)}ms)`
 );
+
+const life = lifecycle();
+console.log('\nEntity lifecycle through the add-on\'s own event handlers');
+console.log(
+  `  spawned ${life.made}, helmet ${life.helmet ?? 'none'}, ` +
+    `stats ${life.hits} hit / ${life.damageDealt} dmg / ${life.botKills} kill, ` +
+    `respawn scheduled ${life.scheduled}, bots after respawn ${life.brainsAfterRespawn}, ` +
+    `errors ${life.errors.total}`
+);
+expect(life.made === 2, `spawnBotsNear creates the requested bots (made ${life.made})`);
+expect(Boolean(life.helmet), `the spawn path equips armour (helmet ${life.helmet ?? 'none'})`);
+expect(life.hits === 1 && life.damageDealt === 5, 'hitting a bot records damage and a hit');
+expect(life.botKills === 1, 'killing a bot records a kill');
+expect(life.brainsAfterDeath === 1, `the dead bot's brain is dropped (${life.brainsAfterDeath} left)`);
+expect(life.blocksLeft === 0, 'blocks placed by the dead bot are cleaned up');
+expect(life.scheduled === 1, `a respawn is scheduled, not immediate (${life.scheduled})`);
+expect(life.brainsAfterRespawn === 2, `the bot comes back (${life.brainsAfterRespawn} bots)`);
+expect(life.remaining === 0, `removeAllBots clears everything (${life.remaining} left)`);
+expect(
+  life.errors.total === 0,
+  `the lifecycle throws nothing internally (${life.errors.total}` +
+    (life.errors.total ? ': ' + life.errors.byMessage.map(([m, n]) => `${m} x${n}`).join('; ') : '') +
+    ')'
+);
+
+const fights = [1, 3, 5].map((level) => ({ level, ...fullFight({ level }) }));
+console.log('\nSixty-second fight with a hostile opponent (UHC kit)');
+console.log('  Lv   swings  blocks  suppressed errors');
+for (const f of fights) {
+  console.log(
+    `  ${f.level}   ${String(f.swings).padStart(6)}  ${String(f.placed).padStart(6)}  ${f.errors.total}` +
+      (f.errors.total ? '  ' + f.errors.byMessage.map(([m, n]) => `${m} (x${n})`).join('; ') : '')
+  );
+}
+expect(
+  fights.every((f) => f.errors.total === 0),
+  'a full fight throws nothing internally (all levels)'
+);
+expect(fights.every((f) => f.swings > 0), 'the bot attacks throughout a long fight');
 
 const noComp = noComponentPath();
 console.log('\nItem handling without a minecraft:equippable component');
