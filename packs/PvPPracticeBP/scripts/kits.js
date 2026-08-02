@@ -31,6 +31,95 @@ function equippable(entity) {
   return safe(() => entity.getComponent('minecraft:equippable'));
 }
 
+function inventoryOf(entity) {
+  return safe(() => entity.getComponent('minecraft:inventory')?.container);
+}
+
+/**
+ * What the bot is "holding" on builds with no equippable component.
+ *
+ * On that path the main hand cannot be read back, so the item is *left in the inventory* and
+ * only mirrored into the display slot with /replaceitem. Moving it out of the container - as
+ * this used to - meant the item existed nowhere the code could find it again: placement and
+ * eating both silently failed, and the stack it came from was destroyed.
+ *
+ * @type {Map<string, string>} entityId -> typeId
+ */
+const virtualHand = new Map();
+
+export function forgetHand(entityId) {
+  virtualHand.delete(entityId);
+}
+
+export function noteHand(bot, typeId) {
+  virtualHand.set(bot.id, typeId);
+}
+
+/** Removes `amount` of `typeId` from the entity's inventory. False if it does not have them. */
+export function consumeItem(entity, typeId, amount = 1) {
+  return (
+    safe(() => {
+      const container = inventoryOf(entity);
+      if (!container) return false;
+      if (countItem(entity, typeId) < amount) return false;
+
+      let needed = amount;
+      for (let i = 0; i < container.size && needed > 0; i++) {
+        const stack = container.getItem(i);
+        if (!stack || stack.typeId !== typeId) continue;
+        const take = Math.min(stack.amount, needed);
+        needed -= take;
+        if (stack.amount - take <= 0) {
+          container.setItem(i, undefined);
+        } else {
+          stack.amount -= take;
+          container.setItem(i, stack);
+        }
+      }
+      return needed === 0;
+    }, false) ?? false
+  );
+}
+
+export function countItem(entity, typeId) {
+  return (
+    safe(() => {
+      const container = inventoryOf(entity);
+      if (!container) return 0;
+      let n = 0;
+      for (let i = 0; i < container.size; i++) {
+        const stack = container.getItem(i);
+        if (stack?.typeId === typeId) n += stack.amount;
+      }
+      return n;
+    }, 0) ?? 0
+  );
+}
+
+function findInContainer(entity, typeId) {
+  return safe(() => {
+    const container = inventoryOf(entity);
+    if (!container) return undefined;
+    for (let i = 0; i < container.size; i++) {
+      const stack = container.getItem(i);
+      if (stack?.typeId === typeId) return stack;
+    }
+    return undefined;
+  });
+}
+
+/**
+ * The item stack the bot is holding, whichever mechanism is in play. Combat reads this for
+ * weapon damage and enchantments, so it has to work on the command path too - otherwise a
+ * bot visibly holding a netherite sword punches for 1.
+ */
+export function getHeldStack(bot) {
+  const real = safe(() => equippable(bot)?.getEquipment(EquipmentSlot.Mainhand));
+  if (real) return real;
+  const virtual = virtualHand.get(bot.id);
+  return virtual ? findInContainer(bot, virtual) : undefined;
+}
+
 function enchant(stack, list) {
   if (!stack || !list?.length) return stack;
   safe(() => {
@@ -125,7 +214,18 @@ export function applyKit(bot, kitId) {
 
   if (kit.mainhand) {
     const stack = enchant(makeStack(kit.mainhand), kit.enchants?.[kit.mainhand]);
-    if (stack) equipItem(bot, EquipmentSlot.Mainhand, stack);
+    if (stack) {
+      const path = equipItem(bot, EquipmentSlot.Mainhand, stack);
+      if (path !== 'component') {
+        // On the command path the hand cannot be read back, so a weapon that only exists in
+        // the display slot is invisible to the code: once the bot swapped to a block or an
+        // apple it could never find its sword again. Keep a copy in the inventory and record
+        // that this is what it is holding.
+        const spare = enchant(makeStack(kit.mainhand), kit.enchants?.[kit.mainhand]);
+        if (spare) safe(() => inventoryOf(bot)?.addItem(spare));
+        noteHand(bot, kit.mainhand);
+      }
+    }
   }
   if (kit.offhand) {
     const stack = makeStack(kit.offhand);
@@ -152,66 +252,88 @@ export function applyKit(bot, kitId) {
 /** Swaps the bot's main hand to `typeId` if it is carrying one - used to switch bow <-> sword. */
 export function switchMainhand(bot, typeId) {
   if (!typeId) return false;
-  return (
-    safe(() => {
-      const comp = equippable(bot);
-      const container = bot.getComponent('minecraft:inventory')?.container;
-      const current = comp?.getEquipment(EquipmentSlot.Mainhand);
-      if (current?.typeId === typeId) return true;
-      if (!container) return false;
 
-      for (let i = 0; i < container.size; i++) {
-        const stack = container.getItem(i);
-        if (stack?.typeId !== typeId) continue;
+  const comp = equippable(bot);
+  const container = inventoryOf(bot);
 
-        // Swap: what is in hand goes into the slot the new item came from. When the hand is
-        // empty `current` is undefined, and writing that into the slot would destroy the
-        // item we are about to pick up - so clear the slot only once the swap succeeded.
-        if (comp) {
+  if (comp) {
+    return (
+      safe(() => {
+        const current = comp.getEquipment(EquipmentSlot.Mainhand);
+        if (current?.typeId === typeId) return true;
+        if (!container) return false;
+
+        for (let i = 0; i < container.size; i++) {
+          const stack = container.getItem(i);
+          if (stack?.typeId !== typeId) continue;
+          // Swap: the new item goes to the hand, the old one takes its slot. Order matters -
+          // writing the (possibly undefined) old item first would wipe the slot being read.
           comp.setEquipment(EquipmentSlot.Mainhand, stack);
-        } else {
-          bot.runCommand(`replaceitem entity @s slot.weapon.mainhand 0 ${stack.typeId} ${stack.amount}`);
+          container.setItem(i, current);
+          virtualHand.set(bot.id, typeId);
+          return true;
         }
-        container.setItem(i, current);
-        return true;
-      }
-      return false;
-    }, false) ?? false
-  );
+        return false;
+      }, false) ?? false
+    );
+  }
+
+  // Command path: mirror into the display slot only. The item stays in the inventory, which
+  // is the only place this path can find or spend it later.
+  if (countItem(bot, typeId) <= 0) return false;
+  const shown =
+    safe(() => {
+      bot.runCommand(`replaceitem entity @s slot.weapon.mainhand 0 ${typeId} 1`);
+      return true;
+    }, false) ?? false;
+  if (shown) virtualHand.set(bot.id, typeId);
+  return shown;
 }
 
 /**
- * Consumes from the *main hand* rather than the inventory.
+ * Consumes from the hand.
  *
- * Eating works on the item you are holding. Draining the inventory instead silently failed
- * whenever the last golden apple was the one in the bot's hand - it ate, got nothing, and
- * kept holding the apple.
+ * Eating and placing both spend the item you are holding. On the component path that is the
+ * main-hand stack; on the command path the item never left the inventory, so it is spent from
+ * there and the display slot is refreshed.
  */
 export function consumeHeldItem(bot, typeId, amount = 1) {
-  return (
-    safe(() => {
-      const comp = equippable(bot);
-      if (!comp) return false;
-      const stack = comp.getEquipment(EquipmentSlot.Mainhand);
-      if (stack?.typeId !== typeId) return false;
+  const comp = equippable(bot);
 
-      if (stack.amount <= amount) {
-        comp.setEquipment(EquipmentSlot.Mainhand, undefined);
-      } else {
-        stack.amount -= amount;
-        comp.setEquipment(EquipmentSlot.Mainhand, stack);
-      }
-      return true;
-    }, false) ?? false
-  );
+  if (comp) {
+    return (
+      safe(() => {
+        const stack = comp.getEquipment(EquipmentSlot.Mainhand);
+        if (stack?.typeId !== typeId) return false;
+
+        if (stack.amount <= amount) {
+          comp.setEquipment(EquipmentSlot.Mainhand, undefined);
+          virtualHand.delete(bot.id);
+        } else {
+          stack.amount -= amount;
+          comp.setEquipment(EquipmentSlot.Mainhand, stack);
+        }
+        return true;
+      }, false) ?? false
+    );
+  }
+
+  if (virtualHand.get(bot.id) !== typeId) return false;
+  if (!consumeItem(bot, typeId, amount)) return false;
+
+  if (countItem(bot, typeId) <= 0) {
+    virtualHand.delete(bot.id);
+    safe(() => bot.runCommand('replaceitem entity @s slot.weapon.mainhand 0 air'));
+  }
+  return true;
 }
 
 /**
  * Wears down one equipment slot, breaking the item when it runs out.
  *
- * Nothing in the engine applies durability to script-driven combat, so the bot's gear used
- * to last forever - a netherite bot could grind through a hundred fights on one sword while
- * the player it is copying would have watched theirs shatter.
+ * Nothing in the engine applies durability to script-driven combat, so the bot's gear would
+ * otherwise last forever, while the player it is copying watches theirs shatter. Only
+ * available on the component path - the command path cannot read an item back to damage it.
  */
 export function damageEquipment(bot, slot, amount = 1) {
   return (
@@ -225,10 +347,11 @@ export function damageEquipment(bot, slot, amount = 1) {
 
       // Unbreaking: each level gives a chance to skip the wear entirely.
       let applied = 0;
-      const unbreaking = safe(() => {
-        const e = stack.getComponent('minecraft:enchantable')?.getEnchantment('unbreaking');
-        return e ? e.level : 0;
-      }, 0) ?? 0;
+      const unbreaking =
+        safe(() => {
+          const e = stack.getComponent('minecraft:enchantable')?.getEnchantment('unbreaking');
+          return e ? e.level : 0;
+        }, 0) ?? 0;
       for (let i = 0; i < amount; i++) {
         if (unbreaking > 0 && Math.random() < unbreaking / (unbreaking + 1)) continue;
         applied++;
@@ -252,15 +375,6 @@ export const ARMOUR_EQUIPMENT_SLOTS = ARMOUR_SLOTS;
 
 /** True if the bot is carrying, or already holding, an item of this type. */
 export function hasItem(bot, typeId) {
-  return (
-    safe(() => {
-      if (equippable(bot)?.getEquipment(EquipmentSlot.Mainhand)?.typeId === typeId) return true;
-      const container = bot.getComponent('minecraft:inventory')?.container;
-      if (!container) return false;
-      for (let i = 0; i < container.size; i++) {
-        if (container.getItem(i)?.typeId === typeId) return true;
-      }
-      return false;
-    }, false) ?? false
-  );
+  if (getHeldStack(bot)?.typeId === typeId) return true;
+  return countItem(bot, typeId) > 0;
 }

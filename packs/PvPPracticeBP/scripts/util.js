@@ -34,6 +34,40 @@ export function chance(p) {
   return rand() < p;
 }
 
+/**
+ * A private random stream.
+ *
+ * Every bot gets its own, seeded from its entity id. Sharing one global generator made
+ * desynchronisation a matter of luck: whether two bots ended up in phase depended on how many
+ * numbers everything else in the add-on happened to have drawn first, so the same code could
+ * look fine in one fight and produce two puppets moving as one in the next.
+ */
+export function makeRng(seedText) {
+  let s = 2166136261 >>> 0;
+  for (let i = 0; i < String(seedText).length; i++) {
+    s ^= String(seedText).charCodeAt(i);
+    s = Math.imul(s, 16777619) >>> 0;
+  }
+  if (s === 0) s = 0x9e3779b9;
+
+  const next = () => {
+    s ^= s << 13;
+    s ^= s >>> 17;
+    s ^= s << 5;
+    return ((s >>> 0) % 100000) / 100000;
+  };
+
+  return {
+    next,
+    chance: (p) => next() < p,
+    range: (min, max) => min + next() * (max - min),
+    int: (min, max) => Math.floor(min + next() * (max - min + 1)),
+    /** Roughly normal noise in [-1, 1]. */
+    gauss: () => (next() + next() + next() - 1.5) / 1.5,
+    sign: () => (next() < 0.5 ? 1 : -1),
+  };
+}
+
 export function pick(list) {
   return list[Math.min(list.length - 1, Math.floor(rand() * list.length))];
 }

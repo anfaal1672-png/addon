@@ -26,7 +26,7 @@ import {
   mlgWater,
   towerUp,
 } from './blocks.js';
-import { consumeHeldItem, hasItem, switchMainhand } from './kits.js';
+import { consumeHeldItem, forgetHand, hasItem, switchMainhand } from './kits.js';
 import { USING_BOW, USING_ITEM, USING_NONE, playSwing, setUsing } from './anim.js';
 import {
   combatVelocity,
@@ -43,14 +43,12 @@ import { drawTime, incomingThreat, shootArrow } from './ranged.js';
 import { getSettings } from './state.js';
 import {
   V,
+  angleDelta,
   approachAngle,
-  chance,
   clamp,
   directionToRotation,
-  angleDelta,
-  gauss,
   isAlive,
-  randInt,
+  makeRng,
   safe,
 } from './util.js';
 
@@ -84,6 +82,15 @@ export class BotBrain {
     this.kit = kit;
     this.home = home;
 
+    /**
+     * This bot's own random stream, seeded from its entity id.
+     *
+     * Everything personal - phase, timing error, strafe flips, misplays, tremor - draws from
+     * here rather than a shared generator, so two bots can never fall into the same sequence
+     * no matter what order they are ticked in or what else drew numbers first.
+     */
+    this.rng = makeRng(entity.id);
+
     /** @type {import('@minecraft/server').Entity | undefined} */
     this.target = undefined;
     this.perceived = undefined;
@@ -92,10 +99,10 @@ export class BotBrain {
     // Two bots created on the same tick, running identical code, otherwise decide identical
     // things on identical ticks forever: they swing in unison, flip strafe direction in
     // unison and read as one entity rendered twice. Real opponents are never in phase.
-    this.phase = randInt(0, 19);
+    this.phase = this.rng.int(0, 19);
 
     /** Reaction times, attention lapses, drift, tilt and hand tremor all live here. */
-    this.human = new HumanState(this.profile);
+    this.human = new HumanState(this.profile, this.rng);
     /** Target state the bot is entitled to know about, delayed by smooth-pursuit lag. */
     this.perceptionQueue = new Delayed();
     this.nextGlance = -999 + this.phase;
@@ -107,7 +114,7 @@ export class BotBrain {
 
     this.lastSwingTick = -999 + this.phase;
     this.lastAirSwing = -999 + this.phase;
-    this.airSwingInterval = randInt(2, 5);
+    this.airSwingInterval = this.rng.int(2, 5);
     this.placeFocus = undefined;
     /**
      * How many ticks past the end of the target's invulnerability this bot actually swings.
@@ -116,13 +123,13 @@ export class BotBrain {
      * bot fighting the same opponent swings on precisely the same tick, so two of them move
      * as one object rendered twice.
      */
-    this.swingBias = randInt(0, 2);
+    this.swingBias = this.rng.int(0, 2);
     this.lastTargetScan = -999 + this.phase;
     this.critWaitUntil = 0;
     this.sprintPauseUntil = 0;
     this.comboUntil = 0;
 
-    this.strafeSign = chance(0.5) ? 1 : -1;
+    this.strafeSign = this.rng.sign();
     this.strafeUntil = 0;
     this.aimNoise = { x: 0, y: 0 };
     this.aimNoiseUntil = 0;
@@ -195,7 +202,7 @@ export class BotBrain {
     // Getting hit from behind by someone else pulls the bot's attention across.
     if (source && source.id !== this.target?.id && this.level >= 3) {
       const stickiness = 1 - this.profile.jitter;
-      if (chance(0.35 * stickiness)) this.target = source;
+      if (this.rng.chance(0.35 * stickiness)) this.target = source;
     }
     // Being hit rattles people: latencies rise and aim gets shakier for a moment.
     this.human.rattle(tick);
@@ -258,6 +265,7 @@ export class BotBrain {
   dispose(dimensionLookup) {
     cleanupBlocks(dimensionLookup, this.placed);
     forgetPlacements(this.id);
+    forgetHand(this.id);
   }
 
   /* ------------------------------------------------------------------ tick */
@@ -272,7 +280,11 @@ export class BotBrain {
 
     this.human.update(tick);
 
-    const hadTarget = this.target;
+    // Compared by id, not by object identity: the script API hands out a *new* Entity wrapper
+    // every time you query the world, so `!==` is true even when it is the same opponent.
+    // Getting this wrong made the bot re-engage on every rescan and stand frozen through the
+    // reaction delay again and again - which looked like "it never runs".
+    const hadTargetId = this.target?.id;
     this.acquireTarget(tick);
 
     if (!this.target) {
@@ -281,7 +293,7 @@ export class BotBrain {
     }
 
     // Noticing a new opponent costs a full choice reaction before anything else happens.
-    if (this.target !== hadTarget) {
+    if (this.target.id !== hadTargetId) {
       this.human.engage(tick);
       this.engageReadyAt = tick + Math.round(this.human.decisionLatency(tick));
       this.perceptionQueue.clear();
@@ -369,7 +381,7 @@ export class BotBrain {
     // pursuit lag. A fixed sampling period is machine-like on its own, and zero lag makes
     // even a "slow" bot able to punish something the instant it happens.
     if (tick >= this.nextGlance) {
-      const interval = sampleLatency(this.profile.reactionTicks, this.profile.reactionJitter);
+      const interval = sampleLatency(this.profile.reactionTicks, this.profile.reactionJitter, this.rng);
       this.nextGlance = tick + Math.max(1, Math.round(interval));
 
       const snapshot = safe(() => ({
@@ -400,8 +412,8 @@ export class BotBrain {
   aim(tick) {
     if (tick > this.aimNoiseUntil) {
       const e = this.profile.aimError;
-      this.aimNoise = { x: gauss() * e * 0.6, y: gauss() * e };
-      this.aimNoiseUntil = tick + randInt(4, 12);
+      this.aimNoise = { x: this.rng.gauss() * e * 0.6, y: this.rng.gauss() * e };
+      this.aimNoiseUntil = tick + this.rng.int(4, 12);
     }
 
     safe(() => {
@@ -418,8 +430,8 @@ export class BotBrain {
       // The hand is a spring-damper with momentum, not a linear tracker. It overshoots and
       // corrects, and it never fully stops moving - both of which a perfect tracker cannot do.
       const tuning = aimTuning(this.profile, this.human.formFactor(tick));
-      this.aimYaw = this.aimYawAxis.step(want.y + this.aimNoise.y, tuning);
-      this.aimPitch = clamp(this.aimPitchAxis.step(want.x + this.aimNoise.x, tuning), -89, 89);
+      this.aimYaw = this.aimYawAxis.step(want.y + this.aimNoise.y, tuning, this.rng);
+      this.aimPitch = clamp(this.aimPitchAxis.step(want.x + this.aimNoise.x, tuning, this.rng), -89, 89);
     });
   }
 
@@ -469,8 +481,8 @@ export class BotBrain {
 
   idle(tick) {
     // No opponent: stand still, face forward, occasionally shuffle so it does not look frozen.
-    if (tick % 40 === 0 && chance(0.3)) {
-      this.strafeSign = chance(0.5) ? 1 : -1;
+    if (tick % 40 === 0 && this.rng.chance(0.3)) {
+      this.strafeSign = this.rng.sign();
     }
     stopHorizontal(this.entity);
     this.sprinting = false;
@@ -534,8 +546,8 @@ export class BotBrain {
 
     // Circle strafing: the sign flips on a timer that gets tighter with skill.
     if (tick > this.strafeUntil) {
-      this.strafeSign = chance(0.5) ? 1 : -1;
-      this.strafeUntil = tick + randInt(Math.round(24 - 14 * p.strafe), Math.round(46 - 22 * p.strafe));
+      this.strafeSign = this.rng.sign();
+      this.strafeUntil = tick + this.rng.int(Math.round(24 - 14 * p.strafe), Math.round(46 - 22 * p.strafe));
     }
     // Strafing is a spacing tool, not a travel tool: it fades out the further away the
     // opponent is, otherwise the sideways component eats the closing speed and the bot
@@ -565,7 +577,7 @@ export class BotBrain {
       // A projectile that arrives faster than the bot's reaction time cannot be dodged, which
       // is why point-blank arrows hit and long-range ones do not.
       const canSee = threat && threat.ticks >= Math.round(this.human.decisionLatency(tick));
-      if (canSee && isAlive(threat.entity) && chance(p.dodgeSkill)) {
+      if (canSee && isAlive(threat.entity) && this.rng.chance(p.dodgeSkill)) {
         strafe = 0;
         const dodge = threat.dodge;
         stepWithTerrain(
@@ -573,7 +585,7 @@ export class BotBrain {
           { x: dodge.x * SPRINT_SPEED, z: dodge.z * SPRINT_SPEED },
           { sprinting: true }
         );
-        if (threat.ticks < 6 && chance(p.dodgeSkill * 0.5)) {
+        if (threat.ticks < 6 && this.rng.chance(p.dodgeSkill * 0.5)) {
           jump(this.entity);
         }
         return;
@@ -590,7 +602,7 @@ export class BotBrain {
     const sprinting =
       tick > this.sprintPauseUntil &&
       p.sprintSkill > 0.05 &&
-      chance(0.6 + 0.4 * p.sprintSkill) &&
+      this.rng.chance(0.6 + 0.4 * p.sprintSkill) &&
       // Sprinting away is just as much a thing as sprinting in - a bot that only ever
       // sprints towards you crawls backwards whenever it wants distance.
       ((approach > 0 && dist > 1.4) || disengaging);
@@ -626,13 +638,13 @@ export class BotBrain {
     setUsing(this.entity, USING_NONE);
 
     // Gap in the way: bridge across it rather than giving up the chase.
-    if (settings.allowBuilding && terrain.gap >= 3 && p.buildSkill > 0.3 && chance(p.buildSkill)) {
+    if (settings.allowBuilding && terrain.gap >= 3 && p.buildSkill > 0.3 && this.rng.chance(p.buildSkill)) {
       bridgeForward(this.entity, flat, this.placed, this.placeOpts(tick));
     }
 
     // Under pressure with blocks in the bag: tower or wall off, exactly like a real clutch.
     if (settings.allowBuilding && this.beingCombod(tick) && p.buildSkill > 0.5) {
-      if (chance(p.buildSkill * 0.25)) {
+      if (this.rng.chance(p.buildSkill * 0.25)) {
         if (this.healthFraction < 0.4) {
           jump(this.entity);
           towerUp(this.entity, this.placed, this.placeOpts(tick));
@@ -714,7 +726,7 @@ export class BotBrain {
       // and a fixed period is also what made two bots spam in perfect unison.
       if (dist < 6 && tick - this.lastAirSwing >= this.airSwingInterval) {
         this.lastAirSwing = tick;
-        this.airSwingInterval = Math.max(2, Math.round(20 / p.cps)) + randInt(0, 3);
+        this.airSwingInterval = Math.max(2, Math.round(20 / p.cps)) + this.rng.int(0, 3);
         playSwing(this.entity);
       }
       return;
@@ -722,7 +734,7 @@ export class BotBrain {
 
     // A little jitter on the interval: perfectly periodic clicking is machine-like, and two
     // bots on the same cadence attack in lockstep.
-    const interval = Math.max(1, Math.round(20 / p.cps) + (chance(0.35 * p.jitter + 0.15) ? 1 : 0));
+    const interval = Math.max(1, Math.round(20 / p.cps) + (this.rng.chance(0.35 * p.jitter + 0.15) ? 1 : 0));
     if (tick - this.lastSwingTick < interval) return;
 
     // A player cannot hit through a wall, so neither can the bot. Checked before the swing
@@ -730,7 +742,7 @@ export class BotBrain {
     if (!hasLineOfSight(this.entity, this.target)) return;
 
     const since = ticksSinceDamage(this.target.id, tick);
-    const disciplined = chance(p.iframeAwareness);
+    const disciplined = this.rng.chance(p.iframeAwareness);
     const onGround = safe(() => this.entity.isOnGround, false) ?? false;
     const canCrit = p.critSkill > 0 && dist < reach - 0.2;
 
@@ -742,13 +754,13 @@ export class BotBrain {
       // The target is invulnerable. A good bot spends the window setting up the next
       // jump-crit so that the apex lines up with the moment invulnerability ends;
       // a bad bot just mashes through it for nothing.
-      if (canCrit && onGround && since >= 4 && since <= 7 && chance(p.critSkill)) {
+      if (canCrit && onGround && since >= 4 && since <= 7 && this.rng.chance(p.critSkill)) {
         this.critJump();
         this.critWaitUntil = tick + 8;
         return;
       }
       if (disciplined) return;
-    } else if (canCrit && onGround && chance(p.critSkill)) {
+    } else if (canCrit && onGround && this.rng.chance(p.critSkill)) {
       // Opening hit of an exchange: hop first, connect on the way down.
       jump(this.entity);
       this.critWaitUntil = tick + 8;
@@ -764,7 +776,7 @@ export class BotBrain {
     this.critWaitUntil = 0;
     // Re-roll the human timing error for the next exchange. Two ticks is about 100 ms, which
     // is roughly the spread a real player has even when they know the window exactly.
-    this.swingBias = randInt(0, 2 + Math.round(2 * p.jitter));
+    this.swingBias = this.rng.int(0, 2 + Math.round(2 * p.jitter));
     const result = swing(this.entity, this.target, {
       tick,
       missChance: 1 - hitChance,
@@ -800,8 +812,8 @@ export class BotBrain {
     // Keep moving while drawing: back away if too close, strafe otherwise.
     const approach = dist < 6 ? -1 : dist > 22 ? 0.7 : 0;
     if (tick > this.strafeUntil) {
-      this.strafeSign = chance(0.5) ? 1 : -1;
-      this.strafeUntil = tick + randInt(20, 40);
+      this.strafeSign = this.rng.sign();
+      this.strafeUntil = tick + this.rng.int(20, 40);
     }
     const vel = combatVelocity({
       toTarget: flat,
@@ -839,7 +851,7 @@ export class BotBrain {
     });
     this.bow.charging = false;
     setUsing(this.entity, USING_NONE);
-    this.bow.nextShotTick = tick + randInt(4, 10) + Math.round(10 * (1 - p.bowSkill));
+    this.bow.nextShotTick = tick + this.rng.int(4, 10) + Math.round(10 * (1 - p.bowSkill));
     if (!fired) this.bow.nextShotTick = tick + 20;
   }
 
@@ -957,7 +969,7 @@ export class BotBrain {
     }
 
     if (voidBelow(this.entity, 5)) {
-      if (getSettings().allowBuilding && p.buildSkill > 0.5 && chance(p.buildSkill)) {
+      if (getSettings().allowBuilding && p.buildSkill > 0.5 && this.rng.chance(p.buildSkill)) {
         const dir = safe(() => {
           const v = this.entity.getVelocity();
           return V.normalizeXZ({ x: -v.x, z: -v.z });

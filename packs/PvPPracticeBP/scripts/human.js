@@ -18,7 +18,7 @@
  * never quite stops moving.
  */
 
-import { clamp, gauss, rand, randRange } from './util.js';
+import { clamp, gauss, makeRng } from './util.js';
 
 /**
  * Samples a reaction time.
@@ -27,8 +27,8 @@ import { clamp, gauss, rand, randRange } from './util.js';
  * occasional very slow responses, so this is drawn log-normally rather than from a bell
  * curve. `jitter` is the spread as a fraction of the mean.
  */
-export function sampleLatency(meanTicks, jitter = 0.35) {
-  const normal = gauss() * 1.4;
+export function sampleLatency(meanTicks, jitter = 0.35, rng) {
+  const normal = (rng ? rng.gauss() : gauss()) * 1.4;
   const scaled = meanTicks * Math.exp(normal * jitter - (jitter * jitter) / 2);
   return Math.max(1, scaled);
 }
@@ -76,15 +76,16 @@ export class Delayed {
  */
 export class HumanState {
   /** @param {import('./config.js').LevelProfile} profile */
-  constructor(profile) {
+  constructor(profile, rng = makeRng('anonymous')) {
     this.profile = profile;
+    this.rng = rng;
 
     // Everyone has a slightly different baseline. Two level 4 bots are not the same player.
-    this.personalBias = randRange(0.85, 1.15);
+    this.personalBias = rng.range(0.85, 1.15);
 
     // Slow performance drift, the reason your aim is better in one minute than the next.
-    this.driftPhase = randRange(0, Math.PI * 2);
-    this.driftPeriod = randRange(500, 1400);
+    this.driftPhase = rng.range(0, Math.PI * 2);
+    this.driftPeriod = rng.range(500, 1400);
 
     this.lapseUntil = -1;
     this.lapseCheckedTick = -1;
@@ -102,8 +103,8 @@ export class HumanState {
     // for a strong player, frequent for a weak one.
     if (tick !== this.lapseCheckedTick) {
       this.lapseCheckedTick = tick;
-      if (tick > this.lapseUntil && rand() < this.profile.lapseChance / 20) {
-        this.lapseUntil = tick + Math.round(randRange(6, 20));
+      if (tick > this.lapseUntil && this.rng.next() < this.profile.lapseChance / 20) {
+        this.lapseUntil = tick + Math.round(this.rng.range(6, 20));
       }
     }
   }
@@ -147,7 +148,10 @@ export class HumanState {
    * under it, so no combination of level tuning and lucky sampling may either.
    */
   decisionLatency(tick) {
-    return Math.max(3, sampleLatency(this.profile.decisionTicks * this.formFactor(tick), this.profile.reactionJitter));
+    return Math.max(
+      3,
+      sampleLatency(this.profile.decisionTicks * this.formFactor(tick), this.profile.reactionJitter, this.rng)
+    );
   }
 
   /**
@@ -158,7 +162,7 @@ export class HumanState {
   trackingLatency(tick) {
     return Math.max(
       2,
-      sampleLatency(this.profile.reactionTicks * this.formFactor(tick), this.profile.reactionJitter * 0.6)
+      sampleLatency(this.profile.reactionTicks * this.formFactor(tick), this.profile.reactionJitter * 0.6, this.rng)
     );
   }
 }
@@ -181,10 +185,10 @@ export class AimAxis {
     this.wrap = wrap;
   }
 
-  step(target, { maxSpeed, stiffness, damping, tremor }) {
+  step(target, { maxSpeed, stiffness, damping, tremor }, rng) {
     const error = this.wrap ? shortestAngle(this.value, target) : target - this.value;
 
-    const accel = error * stiffness - this.velocity * damping + gauss() * tremor;
+    const accel = error * stiffness - this.velocity * damping + (rng ? rng.gauss() : gauss()) * tremor;
     this.velocity = clamp(this.velocity + accel, -maxSpeed, maxSpeed);
     this.value += this.velocity;
 

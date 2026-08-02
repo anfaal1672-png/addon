@@ -17,7 +17,7 @@ import {
   SHARPNESS_PER_LEVEL,
   WEAPON_DAMAGE,
 } from './config.js';
-import { damageEquipment, getEquipment } from './kits.js';
+import { damageEquipment, getEquipment, getHeldStack } from './kits.js';
 import { getSettings } from './state.js';
 import { V, chance, safe } from './util.js';
 
@@ -47,7 +47,7 @@ export function pruneDamageTable(tick) {
 /* ------------------------------------------------------------------ equipment */
 
 export function getHeldItem(entity) {
-  return getEquipment(entity, EquipmentSlot.Mainhand);
+  return getHeldStack(entity);
 }
 
 export function getOffhandItem(entity) {

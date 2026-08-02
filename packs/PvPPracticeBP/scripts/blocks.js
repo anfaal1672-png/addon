@@ -8,7 +8,10 @@
 
 import { BlockPermutation } from '@minecraft/server';
 import { playSwing } from './anim.js';
-import { consumeHeldItem, switchMainhand } from './kits.js';
+import { consumeHeldItem, consumeItem, countItem, switchMainhand } from './kits.js';
+
+// Re-exported so callers keep a single import site for inventory work.
+export { consumeItem, countItem } from './kits.js';
 import { getSettings } from './state.js';
 import { V, safe } from './util.js';
 
@@ -21,46 +24,6 @@ const PLACEABLE_PRIORITY = [
   'minecraft:netherrack',
   'minecraft:end_stone',
 ];
-
-/** Removes one of `typeId` from the entity's inventory. Returns false if it has none. */
-export function consumeItem(entity, typeId, amount = 1) {
-  return (
-    safe(() => {
-      const inv = entity.getComponent('minecraft:inventory');
-      const container = inv?.container;
-      if (!container) return false;
-      let needed = amount;
-      for (let i = 0; i < container.size && needed > 0; i++) {
-        const stack = container.getItem(i);
-        if (!stack || stack.typeId !== typeId) continue;
-        const take = Math.min(stack.amount, needed);
-        needed -= take;
-        if (stack.amount - take <= 0) {
-          container.setItem(i, undefined);
-        } else {
-          stack.amount -= take;
-          container.setItem(i, stack);
-        }
-      }
-      return needed === 0;
-    }, false) ?? false
-  );
-}
-
-export function countItem(entity, typeId) {
-  return (
-    safe(() => {
-      const container = entity.getComponent('minecraft:inventory')?.container;
-      if (!container) return 0;
-      let n = 0;
-      for (let i = 0; i < container.size; i++) {
-        const stack = container.getItem(i);
-        if (stack?.typeId === typeId) n += stack.amount;
-      }
-      return n;
-    }, 0) ?? 0
-  );
-}
 
 /** The best building block the bot is currently carrying, or undefined. */
 export function bestBuildingBlock(entity) {

@@ -19,6 +19,7 @@ const { BotBrain } = await load('bot.js');
 const { applyKit } = await load('kits.js');
 const { ARROW_SPEED, IFRAME_TICKS } = await load('config.js');
 const { PLACE_COOLDOWN, placeBlock } = await load('blocks.js');
+const { consumeHeldItem, switchMainhand } = await load('kits.js');
 const { jump } = await load('movement.js');
 
 /* ------------------------------------------------------------- fake world */
@@ -43,11 +44,16 @@ const dimension = {
     return undefined;
   },
   getEntities({ location, maxDistance }) {
-    return this.entities.filter((e) => {
-      if (!e.isValid) return false;
-      const d = Math.hypot(e.location.x - location.x, e.location.y - location.y, e.location.z - location.z);
-      return d <= maxDistance;
-    });
+    return this.entities
+      .filter((e) => {
+        if (!e.isValid) return false;
+        const d = Math.hypot(e.location.x - location.x, e.location.y - location.y, e.location.z - location.z);
+        return d <= maxDistance;
+      })
+      // The real script API returns a NEW Entity wrapper on every query - two wrappers for the
+      // same entity are never ===. Handing back the same object hid a bug where the bot
+      // treated each rescan as a brand new opponent.
+      .map((e) => wrapEntity(e));
   },
   shots: [],
   spawnEntity(typeId, location) {
@@ -77,6 +83,11 @@ const dimension = {
   },
   playSound() {},
 };
+
+/** A fresh proxy over the same underlying entity, mimicking the script API's wrappers. */
+function wrapEntity(entity) {
+  return new Proxy(entity, {});
+}
 
 let nextId = 1;
 
@@ -171,6 +182,7 @@ class FakeEntity {
       };
     }
     if (id === 'minecraft:equippable') {
+      if (this.noEquippable) return undefined;
       return {
         getEquipment: (slot) => this.equipment.get(slot),
         setEquipment: (slot, item) => {
@@ -308,6 +320,14 @@ function duel(level, { behaviour = 'still', ticks = 600, kit = 'diamond', dummyA
 
     // The dummy is driven by velocity rather than teleported, so knockback from the
     // bot's hits actually composes with its own movement.
+    //
+    // Except when it is meant to be a punching bag: an invincible dummy that never resists
+    // gets launched hundreds of blocks over thirty seconds of sprint hits, and then the
+    // "stationary target" scenario is really measuring a chase.
+    if (behaviour === 'still') {
+      dummy.location = { x: 8, y: GROUND_Y, z: 0 };
+      dummy.velocity = { x: 0, y: 0, z: 0 };
+    }
     if (behaviour === 'strafe') {
       dummy.velocity.x = Math.cos(tick / 12) * 0.2159;
       dummy.velocity.z = -Math.sin(tick / 12) * 0.2159;
@@ -549,6 +569,55 @@ function reactionTest(level, { settle = 80, samples = 24 } = {}) {
   };
 }
 
+/* ------------------------------------------- equipment without a component */
+
+/**
+ * Everything the bot does with items has to work on builds where the entity exposes no
+ * `minecraft:equippable` component and the add-on falls back to /replaceitem.
+ *
+ * That fallback path had never been executed by a single test, because the fake entity here
+ * always provided the component - so every bug in it shipped.
+ */
+function noComponentPath() {
+  dimension.entities.length = 0;
+
+  const bot = new FakeEntity('pvp:bot', { x: 0, y: GROUND_Y, z: 0 });
+  bot.noEquippable = true;
+  applyKit(bot, 'diamond');
+
+  const container = bot.getComponent('minecraft:inventory').container;
+  const count = (typeId) => {
+    let n = 0;
+    for (let i = 0; i < container.size; i++) {
+      const st = container.getItem(i);
+      if (st?.typeId === typeId) n += st.amount;
+    }
+    return n;
+  };
+
+  const cobbleBefore = count('minecraft:cobblestone');
+  const placed = [];
+  const didPlace = placeBlock(bot, { x: 3, y: GROUND_Y, z: 3 }, 'minecraft:cobblestone', placed, { tick: 50 });
+  const cobbleAfter = count('minecraft:cobblestone');
+
+  const applesBefore = count('minecraft:golden_apple');
+  const swappedToApple = switchMainhand(bot, 'minecraft:golden_apple');
+  const ateApple = consumeHeldItem(bot, 'minecraft:golden_apple', 1);
+  const applesAfter = count('minecraft:golden_apple');
+
+  const backToSword = switchMainhand(bot, 'minecraft:diamond_sword');
+
+  return {
+    didPlace,
+    cobbleSpent: cobbleBefore - cobbleAfter,
+    swappedToApple,
+    ateApple,
+    applesSpent: applesBefore - applesAfter,
+    backToSword,
+    commands: bot.commands.length,
+  };
+}
+
 /* ------------------------------------------------------- placement rules */
 
 /**
@@ -675,18 +744,24 @@ expect(
   `level 5 lands jump-crits on most hits (${(still[4].critRate * 100).toFixed(0)}%)`
 );
 
-const twins = twinSync();
-console.log(
-  `\nTwin bots: ${twins.shared}/${twins.total} swings on the same tick ` +
-    `(${(twins.overlap * 100).toFixed(0)}% overlap)`
+// Every level, not just one: the first version of this only checked level 5, and the result
+// turned out to depend on how many numbers the rest of the suite had drawn beforehand.
+const twinsByLevel = [1, 2, 3, 4, 5].map((l) => ({ level: l, ...twinSync(l) }));
+console.log('\nTwin bots on one opponent (identical level, identical start)');
+console.log('  Lv   same-tick swings  divergence');
+for (const t of twinsByLevel) {
+  console.log(
+    `  ${t.level}   ${String(t.shared).padStart(3)}/${String(t.total).padEnd(3)} ` +
+      `${((t.overlap * 100).toFixed(0) + '%').padStart(9)}  ${t.mirrorDivergence.toFixed(2)} blocks`
+  );
+}
+expect(
+  twinsByLevel.every((t) => t.overlap < 0.6),
+  `no level fights in lockstep (worst ${(Math.max(...twinsByLevel.map((t) => t.overlap)) * 100).toFixed(0)}%)`
 );
 expect(
-  twins.overlap < 0.6,
-  `two identical bots do not swing in lockstep (${(twins.overlap * 100).toFixed(0)}% of swings coincide)`
-);
-expect(
-  twins.mirrorDivergence > 1.5,
-  `two identical bots do not move as mirror images (${twins.mirrorDivergence.toFixed(2)} blocks average divergence)`
+  twinsByLevel.every((t) => t.mirrorDivergence > 1.5),
+  `no level moves as a mirror image (worst ${Math.min(...twinsByLevel.map((t) => t.mirrorDivergence)).toFixed(2)} blocks)`
 );
 
 const jumpResult = jumpHeight();
@@ -729,6 +804,16 @@ expect(
   reactions[4].meanMs > 80,
   `even the best level is not superhuman (${Math.round(reactions[4].meanMs)}ms)`
 );
+
+const noComp = noComponentPath();
+console.log('\nItem handling without a minecraft:equippable component');
+expect(noComp.didPlace, 'blocks are still placed');
+expect(noComp.cobbleSpent === 1, `exactly one cobblestone is spent (spent ${noComp.cobbleSpent})`);
+expect(noComp.swappedToApple, 'the bot can switch to a golden apple');
+expect(noComp.ateApple, 'the apple is actually consumed');
+expect(noComp.applesSpent === 1, `exactly one apple is spent (spent ${noComp.applesSpent})`);
+expect(noComp.backToSword, 'the bot switches back to its sword afterwards');
+expect(noComp.commands > 0, 'the /replaceitem fallback was actually exercised');
 
 const rules = placementRules();
 console.log('\nBlock placement rules');
