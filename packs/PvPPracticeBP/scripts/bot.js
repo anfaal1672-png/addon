@@ -22,6 +22,7 @@ import {
   cleanupBlocks,
   consumeItem,
   countItem,
+  forgetPlacements,
   mlgWater,
   towerUp,
 } from './blocks.js';
@@ -97,6 +98,7 @@ export class BotBrain {
     this.lastSwingTick = -999 + this.phase;
     this.lastAirSwing = -999 + this.phase;
     this.airSwingInterval = randInt(2, 5);
+    this.placeFocus = undefined;
     /**
      * How many ticks past the end of the target's invulnerability this bot actually swings.
      *
@@ -189,12 +191,32 @@ export class BotBrain {
     }
   }
 
+  /**
+   * Options handed to every block placement: the tick (for the one-block-at-a-time
+   * cooldown) and a callback that turns the bot to face the block it is about to place.
+   * A player has to be looking at the face they are placing against; a bot that builds a
+   * wall while staring somewhere else is instantly wrong.
+   */
+  placeOpts(tick) {
+    return {
+      tick,
+      onPlace: (pos) => {
+        this.placeFocus = {
+          // Aim at the centre of the block.
+          pos: { x: pos.x + 0.5, y: pos.y + 0.5, z: pos.z + 0.5 },
+          until: tick + 6,
+        };
+      },
+    };
+  }
+
   beingCombod(tick) {
     return this.recentHits.filter((t) => tick - t < 40).length >= 3;
   }
 
   dispose(dimensionLookup) {
     cleanupBlocks(dimensionLookup, this.placed);
+    forgetPlacements(this.id);
   }
 
   /* ------------------------------------------------------------------ tick */
@@ -320,9 +342,13 @@ export class BotBrain {
 
     safe(() => {
       const from = this.entity.getHeadLocation();
-      // Predict where the target is heading - only the good bots do this properly.
-      const lead = V.scale(this.perceived.velocity, 2 * this.profile.comboSkill);
-      const to = V.add(this.perceived.head, lead);
+
+      // Placing a block takes priority over tracking the opponent, for as long as the
+      // placement lasts - that is what a player's view does too.
+      const placing = this.placeFocus && tick < this.placeFocus.until;
+      const to = placing
+        ? this.placeFocus.pos
+        : V.add(this.perceived.head, V.scale(this.perceived.velocity, 2 * this.profile.comboSkill));
       const want = directionToRotation(V.sub(to, from));
 
       const speed = this.profile.turnSpeed;
@@ -335,11 +361,14 @@ export class BotBrain {
    * Turns the body the way a player's body turns: towards where it is walking, catching up
    * to where the head is looking only when it drifts too far or the bot is standing still.
    */
-  faceBody(moveDir, moving) {
+  faceBody(moveDir, moving, tick) {
     const aimYaw = this.aimYaw ?? this.bodyYaw;
     let wantYaw = aimYaw;
 
-    if (moving && (moveDir.x !== 0 || moveDir.z !== 0)) {
+    // While placing a block the body squares up to it, like a player's does.
+    const placing = this.placeFocus && tick !== undefined && tick < this.placeFocus.until;
+
+    if (!placing && moving && (moveDir.x !== 0 || moveDir.z !== 0)) {
       wantYaw = directionToRotation({ x: moveDir.x, y: 0, z: moveDir.z }).y;
 
       // A head can only twist so far off the shoulders; past that the body follows. The clamp
@@ -514,12 +543,12 @@ export class BotBrain {
       allowFall: p.jitter > 0.3,
       airControl: p.kbControl,
     });
-    this.faceBody(vel.dir, V.lengthXZ(vel) > 0.02);
+    this.faceBody(vel.dir, V.lengthXZ(vel) > 0.02, tick);
     setUsing(this.entity, USING_NONE);
 
     // Gap in the way: bridge across it rather than giving up the chase.
     if (settings.allowBuilding && terrain.gap >= 3 && p.buildSkill > 0.3 && chance(p.buildSkill)) {
-      bridgeForward(this.entity, flat, this.placed);
+      bridgeForward(this.entity, flat, this.placed, this.placeOpts(tick));
     }
 
     // Under pressure with blocks in the bag: tower or wall off, exactly like a real clutch.
@@ -527,9 +556,9 @@ export class BotBrain {
       if (chance(p.buildSkill * 0.25)) {
         if (this.healthFraction < 0.4) {
           safe(() => this.entity.isOnGround && this.entity.applyImpulse({ x: 0, y: 0.42, z: 0 }));
-          towerUp(this.entity, this.placed);
+          towerUp(this.entity, this.placed, this.placeOpts(tick));
         } else {
-          blockOff(this.entity, flat, this.placed);
+          blockOff(this.entity, flat, this.placed, this.placeOpts(tick));
         }
       }
     }
@@ -705,7 +734,7 @@ export class BotBrain {
       speedScale: this.bow.charging ? 0.3 : 0.9,
     });
     stepWithTerrain(this.entity, vel, { sprinting: false, airControl: p.kbControl });
-    this.faceBody(vel.dir, V.lengthXZ(vel) > 0.02);
+    this.faceBody(vel.dir, V.lengthXZ(vel) > 0.02, tick);
     this.sprinting = false;
 
     if (!this.bow.charging) {
@@ -762,7 +791,7 @@ export class BotBrain {
         speedScale: 0.3,
       });
       stepWithTerrain(this.entity, vel, { sprinting: false, airControl: p.kbControl });
-      this.faceBody(vel.dir, true);
+      this.faceBody(vel.dir, true, tick);
       this.sprinting = false;
       return true;
     }
@@ -779,7 +808,7 @@ export class BotBrain {
     const normal = countItem(this.entity, 'minecraft:golden_apple') > 0;
     if (!enchanted && !normal) return false;
 
-    if (getSettings().allowBuilding && p.buildSkill > 0.4) blockOff(this.entity, flat, this.placed);
+    if (getSettings().allowBuilding && p.buildSkill > 0.4) blockOff(this.entity, flat, this.placed, this.placeOpts(tick));
 
     const item = enchanted ? 'minecraft:enchanted_golden_apple' : 'minecraft:golden_apple';
 
@@ -852,7 +881,7 @@ export class BotBrain {
           const v = this.entity.getVelocity();
           return V.normalizeXZ({ x: -v.x, z: -v.z });
         }, { x: 0, z: 0 });
-        if (bridgeForward(this.entity, dir, this.placed)) return true;
+        if (bridgeForward(this.entity, dir, this.placed, this.placeOpts(tick))) return true;
       }
       const home = this.home;
       if (home && safe(() => this.entity.location.y < home.location.y - 25, false)) {

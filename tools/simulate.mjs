@@ -18,6 +18,7 @@ const load = (name) => import(pathToFileURL(join(scripts, name)).href);
 const { BotBrain } = await load('bot.js');
 const { applyKit } = await load('kits.js');
 const { ARROW_SPEED, IFRAME_TICKS } = await load('config.js');
+const { PLACE_COOLDOWN, placeBlock } = await load('blocks.js');
 
 /* ------------------------------------------------------------- fake world */
 
@@ -439,6 +440,48 @@ function twinSync(level = 5, ticks = 400) {
   };
 }
 
+/* ------------------------------------------------------- placement rules */
+
+/**
+ * Survival placement rules, exercised directly rather than through a whole fight because
+ * they are absolute: no floating blocks, one block at a time, and look at what you place.
+ */
+function placementRules() {
+  dimension.entities.length = 0;
+
+  const bot = new FakeEntity('pvp:bot', { x: 0, y: GROUND_Y, z: 0 });
+  const container = bot.getComponent('minecraft:inventory').container;
+  container.addItem({ typeId: 'minecraft:cobblestone', amount: 64 });
+
+  const placed = [];
+  const looked = [];
+  const opts = (tick) => ({ tick, onPlace: (pos) => looked.push(pos) });
+
+  // Ground is everything below GROUND_Y, so a block at head height with nothing around it
+  // is unsupported; one resting on the ground is not.
+  const floating = placeBlock(bot, { x: 20, y: GROUND_Y + 5, z: 20 }, 'minecraft:cobblestone', placed, opts(100));
+  const supported = placeBlock(bot, { x: 20, y: GROUND_Y, z: 20 }, 'minecraft:cobblestone', placed, opts(100));
+
+  // Immediately afterwards, a second placement must be refused.
+  const immediate = placeBlock(bot, { x: 21, y: GROUND_Y, z: 20 }, 'minecraft:cobblestone', placed, opts(100));
+  const tooSoon = placeBlock(
+    bot,
+    { x: 22, y: GROUND_Y, z: 20 },
+    'minecraft:cobblestone',
+    placed,
+    opts(100 + PLACE_COOLDOWN - 1)
+  );
+  const afterCooldown = placeBlock(
+    bot,
+    { x: 23, y: GROUND_Y, z: 20 },
+    'minecraft:cobblestone',
+    placed,
+    opts(100 + PLACE_COOLDOWN)
+  );
+
+  return { floating, supported, immediate, tooSoon, afterCooldown, looked: looked.length };
+}
+
 /* ---------------------------------------------------------------- reports */
 
 function table(title, rows) {
@@ -536,6 +579,15 @@ expect(
   twins.mirrorDivergence > 1.5,
   `two identical bots do not move as mirror images (${twins.mirrorDivergence.toFixed(2)} blocks average divergence)`
 );
+
+const rules = placementRules();
+console.log('\nBlock placement rules');
+expect(!rules.floating, 'a block with nothing adjacent is refused (no mid-air placement)');
+expect(rules.supported, 'a block resting against the ground is allowed');
+expect(!rules.immediate, 'a second block in the same tick is refused');
+expect(!rules.tooSoon, `a second block before the ${PLACE_COOLDOWN}-tick cooldown is refused`);
+expect(rules.afterCooldown, 'placement resumes once the cooldown has passed');
+expect(rules.looked > 0, 'the bot is pointed at each block it places');
 
 console.log('');
 if (failures) {

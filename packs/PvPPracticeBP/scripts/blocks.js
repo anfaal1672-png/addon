@@ -8,7 +8,7 @@
 
 import { BlockPermutation } from '@minecraft/server';
 import { playSwing } from './anim.js';
-import { switchMainhand } from './kits.js';
+import { consumeHeldItem, switchMainhand } from './kits.js';
 import { getSettings } from './state.js';
 import { V, safe } from './util.js';
 
@@ -82,20 +82,81 @@ function canPlaceAt(dimension, pos) {
   );
 }
 
+const NEIGHBOURS = [
+  { x: 0, y: -1, z: 0 },
+  { x: 0, y: 1, z: 0 },
+  { x: 1, y: 0, z: 0 },
+  { x: -1, y: 0, z: 0 },
+  { x: 0, y: 0, z: 1 },
+  { x: 0, y: 0, z: -1 },
+];
+
+/**
+ * A player cannot place a block in mid-air - the placement has to be against the face of
+ * something already there. Without this check the bot spawned blocks floating in space,
+ * which nothing in survival can do.
+ */
+export function hasSupport(dimension, pos) {
+  return (
+    safe(() => {
+      for (const n of NEIGHBOURS) {
+        const b = dimension.getBlock({ x: pos.x + n.x, y: pos.y + n.y, z: pos.z + n.z });
+        if (b && !b.isAir && !b.isLiquid) return true;
+      }
+      return false;
+    }, false) ?? false
+  );
+}
+
+/**
+ * Minimum ticks between two placements by the same bot.
+ *
+ * Vanilla places roughly one block every four ticks while the button is held, and there is
+ * no way at all to place two in the same tick - which is exactly what the old block-off code
+ * did, dropping a two-high wall instantly.
+ */
+export const PLACE_COOLDOWN = 4;
+
+/** entityId -> tick of that bot's last placement. */
+const lastPlacement = new Map();
+
+export function canPlaceNow(bot, tick) {
+  const last = lastPlacement.get(bot.id);
+  return last === undefined || tick - last >= PLACE_COOLDOWN;
+}
+
+export function notePlacement(bot, tick) {
+  lastPlacement.set(bot.id, tick);
+}
+
+export function forgetPlacements(botId) {
+  lastPlacement.delete(botId);
+}
+
 /**
  * Places one block, consuming it from the bot's inventory.
  * @returns {boolean} true if a block was actually placed.
  */
-export function placeBlock(bot, pos, typeId, tracker) {
+export function placeBlock(bot, pos, typeId, tracker, { tick, onPlace } = {}) {
   if (!getSettings().allowBuilding) return false;
   const dim = bot.dimension;
   if (!canPlaceAt(dim, pos)) return false;
 
-  // A player has to be holding the block to place it, and their arm swings when they do.
-  // Without both of these the bot conjures blocks out of nothing with a motionless arm,
-  // which is unmistakable.
+  // Survival placement rules the bot was previously ignoring: something to place against,
+  // and one block at a time.
+  if (!hasSupport(dim, pos)) return false;
+  if (tick !== undefined && !canPlaceNow(bot, tick)) return false;
+
+  // A player has to be holding the block to place it, look at where it is going, and their
+  // arm swings when they do. Without these the bot conjures blocks out of nothing, facing
+  // the wrong way, with a motionless arm.
   switchMainhand(bot, typeId);
-  if (!consumeItem(bot, typeId, 1)) return false;
+  onPlace?.(pos);
+
+  // Consume the stack that is now in the hand. Draining the inventory instead fails outright
+  // once switchMainhand has moved the last stack out of it - the same trap the golden apple
+  // fell into.
+  if (!consumeHeldItem(bot, typeId, 1) && !consumeItem(bot, typeId, 1)) return false;
 
   const ok =
     safe(() => {
@@ -105,6 +166,7 @@ export function placeBlock(bot, pos, typeId, tracker) {
 
   if (ok) {
     playSwing(bot);
+    if (tick !== undefined) notePlacement(bot, tick);
     tracker?.push({ x: pos.x, y: pos.y, z: pos.z, dimensionId: dim.id });
     safe(() => dim.playSound('use.stone', pos, { volume: 0.8 }));
   }
@@ -117,22 +179,25 @@ export function placeBlock(bot, pos, typeId, tracker) {
  * "Block off": drops a wall segment between the bot and its opponent so incoming
  * arrows and sprint hits stop. Used at high skill levels when retreating or healing.
  */
-export function blockOff(bot, towardsDir, tracker) {
+export function blockOff(bot, towardsDir, tracker, opts = {}) {
   const type = bestBuildingBlock(bot);
   if (!type) return false;
   const base = bot.location;
   const fx = Math.floor(base.x + towardsDir.x * 1.4);
   const fz = Math.floor(base.z + towardsDir.z * 1.4);
   const fy = Math.floor(base.y);
-  let placed = false;
+
+  // One block per call. This used to drop the whole two-high wall in a single tick, which is
+  // physically impossible for a player - the second block goes up on a later call, so a wall
+  // takes as long to build as it would by hand.
   for (const dy of [0, 1]) {
-    placed = placeBlock(bot, { x: fx, y: fy + dy, z: fz }, type, tracker) || placed;
+    if (placeBlock(bot, { x: fx, y: fy + dy, z: fz }, type, tracker, opts)) return true;
   }
-  return placed;
+  return false;
 }
 
 /** Towers straight up one block, jumping and placing underneath - the classic anti-melee escape. */
-export function towerUp(bot, tracker) {
+export function towerUp(bot, tracker, opts = {}) {
   const type = bestBuildingBlock(bot);
   if (!type) return false;
   const loc = bot.location;
@@ -140,11 +205,11 @@ export function towerUp(bot, tracker) {
   const v = safe(() => bot.getVelocity(), { x: 0, y: 0, z: 0 });
   // Place only at the top of the jump arc, exactly like a player timing a tower.
   if (v.y > 0.02 || v.y < -0.25) return false;
-  return placeBlock(bot, { x: below.x, y: Math.floor(loc.y), z: below.z }, type, tracker);
+  return placeBlock(bot, { x: below.x, y: Math.floor(loc.y), z: below.z }, type, tracker, opts);
 }
 
 /** Bridges one block forward so the bot can cross a gap instead of falling in. */
-export function bridgeForward(bot, dir, tracker) {
+export function bridgeForward(bot, dir, tracker, opts = {}) {
   const type = bestBuildingBlock(bot);
   if (!type) return false;
   const loc = bot.location;
@@ -153,7 +218,7 @@ export function bridgeForward(bot, dir, tracker) {
     y: Math.floor(loc.y) - 1,
     z: Math.floor(loc.z + dir.z * 1.0),
   };
-  return placeBlock(bot, pos, type, tracker);
+  return placeBlock(bot, pos, type, tracker, opts);
 }
 
 /**
@@ -181,7 +246,11 @@ export function mlgWater(bot, tracker) {
 
   const pos = { x: Math.floor(loc.x), y: groundY, z: Math.floor(loc.z) };
   if (!canPlaceAt(dim, pos)) return false;
-  if (!consumeItem(bot, 'minecraft:water_bucket', 1)) return false;
+
+  switchMainhand(bot, 'minecraft:water_bucket');
+  if (!consumeHeldItem(bot, 'minecraft:water_bucket', 1) && !consumeItem(bot, 'minecraft:water_bucket', 1)) {
+    return false;
+  }
 
   safe(() => dim.getBlock(pos).setPermutation(BlockPermutation.resolve('minecraft:water')));
   tracker?.push({ ...pos, dimensionId: dim.id, water: true });
