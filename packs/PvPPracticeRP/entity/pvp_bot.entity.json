@@ -4,7 +4,6 @@
     "description": {
       "identifier": "pvp:bot",
 
-      "//": "Vanilla player model + vanilla Steve texture + vanilla player scale. Nothing is shipped in this pack - every path below resolves to the game's own assets, so the bot is pixel-for-pixel a default Steve.",
       "materials": {
         "default": "entity_alphatest"
       },
@@ -21,7 +20,6 @@
       },
 
       "scripts": {
-        "//": "0.9375 is the exact scale vanilla applies to minecraft:player.",
         "scale": "0.9375",
         "pre_animation": [
           "v.tcos0 = Math.cos(query.modified_distance_moved * 38.17) * query.modified_move_speed / v.gliding_speed_value * 57.3;",
@@ -90,7 +88,6 @@
 
       "render_controllers": ["controller.render.pvp_bot"],
 
-      "//attachables": "Required so vanilla armour + held-item attachables render on this entity, exactly like they do on a player.",
       "enable_attachables": true
     }
   }

@@ -163,7 +163,9 @@ export function installSlashCommands() {
 
       registry.registerCommand(
         {
-          name: 'pvp:clear',
+          // Deliberately not "pvp:clear": the game reserves the bare alias `clear` for
+          // vanilla /clear and logs a conflict warning if we try to claim it.
+          name: 'pvp:clearbots',
           description: 'Remove every PvP practice bot',
           permissionLevel: anyPlayer,
         },

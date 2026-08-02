@@ -25,7 +25,6 @@
         "family": ["pvp_bot", "humanoid", "mob"]
       },
 
-      "//body": "--- Player-identical body / physics ---",
       "minecraft:collision_box": { "width": 0.6, "height": 1.8 },
       "minecraft:physics": { "has_collision": true, "has_gravity": true },
       "minecraft:pushable": { "is_pushable": true, "is_pushable_by_piston": true },
@@ -46,7 +45,6 @@
         "avoid_portals": true
       },
 
-      "//vitals": "--- Player-identical vitals: 20 HP, drowns, burns, falls ---",
       "minecraft:health": { "value": 20, "max": 20 },
       "minecraft:breathable": {
         "total_supply": 15,
@@ -65,7 +63,6 @@
         ]
       },
 
-      "//gear": "--- Full player-style equipment: 4 armour slots + main hand + off hand ---",
       "minecraft:equippable": {
         "slots": [
           { "slot": 0 },
@@ -82,17 +79,14 @@
         "can_be_siphoned_from": false,
         "private": true
       },
-      "//attack": "Vanilla melee is disabled - all damage is dealt by scripts/combat.js so that it matches survival weapon rules exactly.",
       "minecraft:attack": { "damage": 0 },
 
-      "//practice": "--- Practice targets: no drops, no XP, never despawn ---",
       "minecraft:loot": { "table": "loot_tables/empty.json" },
       "minecraft:experience_reward": { "on_death": "0" },
       "minecraft:persistent": {},
       "minecraft:nameable": { "always_show": false, "allow_name_tag_renaming": true },
       "minecraft:conditional_bandwidth_optimization": {},
 
-      "//ai": "--- Only float is left to vanilla AI. All combat/movement is driven by scripts/bot.js ---",
       "minecraft:behavior.float": { "priority": 0 }
     }
   }

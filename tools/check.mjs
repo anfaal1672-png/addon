@@ -49,6 +49,31 @@ for (const file of jsonFiles) {
 }
 if (parsed.size === jsonFiles.length) pass(`${jsonFiles.length} files parse`);
 
+// Minecraft validates pack JSON against a schema and rejects unknown keys. A "//" comment
+// key is a warning inside a behaviour pack and a hard error inside a client entity, so we
+// refuse them everywhere rather than remembering which files tolerate them.
+function findCommentKeys(node, path = '') {
+  const hits = [];
+  if (Array.isArray(node)) {
+    node.forEach((child, i) => hits.push(...findCommentKeys(child, `${path}[${i}]`)));
+  } else if (node && typeof node === 'object') {
+    for (const [key, value] of Object.entries(node)) {
+      if (key.startsWith('//')) hits.push(`${path}/${key}`);
+      hits.push(...findCommentKeys(value, `${path}/${key}`));
+    }
+  }
+  return hits;
+}
+
+let commentKeys = 0;
+for (const [file, data] of parsed) {
+  for (const where of findCommentKeys(data)) {
+    fail(`${relative(ROOT, file)}: comment key at ${where} - the game rejects unknown keys`);
+    commentKeys++;
+  }
+}
+if (commentKeys === 0) pass('no "//" comment keys in pack JSON');
+
 /* ---------------------------------------------------------------- 2. modules */
 
 console.log('Scripts');

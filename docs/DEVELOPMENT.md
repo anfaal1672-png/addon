@@ -53,6 +53,32 @@ npm run build      # dist/*.mcaddon, dist/*.mcpack
 | 弓の誤差がレベルで縮む | 偏差射撃・重力補正が効いている |
 | 高レベルほどフルチャージで撃つ | 引き切らずに連射する下手さが再現できている |
 
+## パックJSONにコメントを書かないこと
+
+Minecraftはパック内のJSONをスキーマ検証していて、**知らないキーを拒否します**。
+慣習的に使われる `"//": "説明"` も例外ではなく、
+
+- ビヘイビアーパックの `components` 直下 → `[Log][warning] ... not present in the Schema`
+- クライアントエンティティの `description` 直下 → `[Animation][error] child '//' not valid here.`
+
+となります。後者はエラーなので見た目が壊れる可能性があります。
+`npm run check` はパックJSON内の `//` で始まるキーを**すべて検出して失敗させます**。
+
+そのため、エンティティ定義の設計意図はJSONではなくここに書いてあります。
+
+### `entities/pvp_bot.json` の設計意図
+
+| 記述 | 理由 |
+|---|---|
+| `collision_box` 0.6 × 1.8 | プレイヤーと同一の当たり判定 |
+| `movement` 0.1 / `jump.static` 0.42 | バニラのプレイヤー値。実際の移動はスクリプトが上書きするが、物理の土台として合わせておく |
+| `attack` damage **0** | バニラのモブ攻撃を無効化し、近接判定を `scripts/combat.js` に一本化するため。これをしないと無敵時間もダメージ式もモブ準拠になる |
+| `equippable` スロット0〜5 | 防具4枚＋メインハンド＋オフハンド。スクリプトから `EntityEquippableComponent` を使うのに必要 |
+| `inventory` 36スロット `private` | ブロック・矢・金リンゴを本当に消費させるため。`private` でプレイヤーが開けないようにする |
+| `loot` 空テーブル / `experience_reward` 0 | 練習台なので装備をばら撒かない |
+| `persistent` | 離れても消えない |
+| `behavior.float` だけ残す | 水に浮く挙動はバニラAIのほうが自然。それ以外のAIを入れるとスクリプトの移動制御と競合する |
+
 ## チューニング
 
 数値はすべて `packs/PvPPracticeBP/scripts/config.js` にあります。
