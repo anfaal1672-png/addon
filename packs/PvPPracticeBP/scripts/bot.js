@@ -26,8 +26,8 @@ import {
   mlgWater,
   towerUp,
 } from './blocks.js';
-import { consumeHeldItem, forgetHand, hasItem, switchMainhand } from './kits.js';
-import { USING_BOW, USING_ITEM, USING_NONE, playSwing, setUsing } from './anim.js';
+import { consumeHeldItem, forgetHand, hasItem, heldOrCarried, switchMainhand } from './kits.js';
+import { USING_BOW, USING_ITEM, USING_NONE, playSwing, setBlocking, setUsing, spawnEatCrumbs } from './anim.js';
 import {
   combatVelocity,
   driveHorizontal,
@@ -150,6 +150,10 @@ export class BotBrain {
 
     /** Sprint state lives here: Entity.isSprinting is read-only, so the engine never has it. */
     this.sprinting = false;
+    /** True while the shield is up: no attacking, sneak-speed movement, damage negated. */
+    this.blocking = false;
+    this.blockUntil = 0;
+    this.blockCooldownUntil = 0;
     /** Yaw the body is currently facing, lerped rather than snapped. */
     this.bodyYaw = safe(() => entity.getRotation().y, 0) ?? 0;
 
@@ -491,6 +495,8 @@ export class BotBrain {
     this.sprinting = false;
     this.bow.charging = false;
     setUsing(this.entity, USING_NONE);
+    setBlocking(this.entity, false);
+    this.blocking = false;
     this.maybeSelfPreserve(tick);
   }
 
@@ -517,6 +523,8 @@ export class BotBrain {
     }
 
     if (this.maybeHeal(tick, flat)) return;
+
+    this.updateShield(tick, dist);
 
     const wantsBow = this.shouldUseBow(dist, tick);
     if (wantsBow) {
@@ -597,10 +605,10 @@ export class BotBrain {
         stepWithTerrain(
           this.entity,
           { x: dodge.x * SPRINT_SPEED, z: dodge.z * SPRINT_SPEED },
-          { sprinting: true }
+          { sprinting: true, tick }
         );
         if (threat.ticks < 6 && this.rng.chance(p.dodgeSkill * 0.5)) {
-          jump(this.entity);
+          jump(this.entity, { tick });
         }
         return;
       }
@@ -613,18 +621,22 @@ export class BotBrain {
       strafe *= 0.4;
     }
 
+    // Sprinting is the default, not an occasional choice. Bedrock PvP is played sprinting
+    // almost the whole time - walking only happens in the moment after a w-tap, while an item
+    // is being used, and for players who have not learned to hold it. Anything else reads as
+    // someone strolling around a duel.
     const sprinting =
       tick > this.sprintPauseUntil &&
-      p.sprintSkill > 0.05 &&
-      this.rng.chance(0.6 + 0.4 * p.sprintSkill) &&
-      // Sprinting away is just as much a thing as sprinting in - a bot that only ever
-      // sprints towards you crawls backwards whenever it wants distance.
-      ((approach > 0 && dist > 1.4) || disengaging);
+      // Only a beginner spends real time at walking pace.
+      this.rng.chance(0.55 + 0.45 * p.sprintSkill) &&
+      dist > 0.6;
     this.sprinting = sprinting;
     this.closing = approach > 0.5;
 
     let speedScale = 1;
     if (vertical > 1.2) speedScale *= 1.05;
+    // A raised shield means sneaking on Bedrock, so movement drops to sneak pace.
+    if (this.blocking) speedScale *= 0.32;
 
     // A circling player cannot also outrun someone sprinting away: the sideways component
     // costs forward speed. Work out how much forward speed is needed just to keep pace with
@@ -646,8 +658,12 @@ export class BotBrain {
     // skill, is what stops a beginner from walking at you like a rail-guided trolley - and it
     // was the reason two level 1 bots stayed exact mirror images of each other all fight.
     if (tick > this.wanderUntil) {
-      this.wanderAngle = this.rng.range(-1, 1) * 35 * p.jitter;
-      this.wanderUntil = tick + this.rng.int(10, 30);
+      // Even a world-class player does not hold a dead straight line while sprinting: the
+      // amplitude shrinks with skill but never reaches zero. Scaling this purely by `jitter`
+      // meant level 5 ran on rails.
+      const amplitude = 6 + 30 * p.jitter;
+      this.wanderAngle = this.rng.range(-1, 1) * amplitude;
+      this.wanderUntil = tick + this.rng.int(8, 26);
     }
     if (this.wanderAngle !== 0) {
       const turned = rotateXZ(vel, this.wanderAngle);
@@ -659,20 +675,21 @@ export class BotBrain {
       sprinting,
       allowFall: p.jitter > 0.3,
       airControl: p.kbControl,
+      tick,
     });
     this.faceBody(vel.dir, V.lengthXZ(vel) > 0.02, tick);
     setUsing(this.entity, USING_NONE);
 
     // Gap in the way: bridge across it rather than giving up the chase.
-    if (settings.allowBuilding && terrain.gap >= 3 && p.buildSkill > 0.3 && this.rng.chance(p.buildSkill)) {
+    if (settings.allowBuilding && !this.blocking && terrain.gap >= 3 && p.buildSkill > 0.3 && this.rng.chance(p.buildSkill)) {
       bridgeForward(this.entity, flat, this.placed, this.placeOpts(tick));
     }
 
     // Under pressure with blocks in the bag: tower or wall off, exactly like a real clutch.
-    if (settings.allowBuilding && this.beingCombod(tick) && p.buildSkill > 0.5) {
+    if (settings.allowBuilding && !this.blocking && this.beingCombod(tick) && p.buildSkill > 0.5) {
       if (this.rng.chance(p.buildSkill * 0.25)) {
         if (this.healthFraction < 0.4) {
-          jump(this.entity);
+          jump(this.entity, { tick });
           towerUp(this.entity, this.placed, this.placeOpts(tick));
         } else {
           blockOff(this.entity, flat, this.placed, this.placeOpts(tick));
@@ -683,6 +700,85 @@ export class BotBrain {
     /* ---- attacking ---- */
 
     this.meleeRoutine(tick, dist, vertical);
+  }
+
+  /* ------------------------------------------------------------- shield */
+
+  hasShield() {
+    return heldOrCarried(this.entity, 'minecraft:shield');
+  }
+
+  /**
+   * Decides whether the shield is up this tick.
+   *
+   * Bedrock shields block everything from the front but stop you attacking, so the whole
+   * skill is in when to raise it and - more importantly - when to drop it again. A beginner
+   * with a shield never touches it; a good player raises it for an incoming arrow or while
+   * they are being run down, and drops it the moment they want to swing back.
+   */
+  updateShield(tick, dist) {
+    const p = this.profile;
+
+    if (p.shieldSkill <= 0 || !this.hasShield()) {
+      if (this.blocking) {
+        this.blocking = false;
+        setBlocking(this.entity, false);
+      }
+      return;
+    }
+
+    if (tick < this.blockUntil) {
+      this.blocking = true;
+      setBlocking(this.entity, true);
+      safe(() => {
+        this.entity.isSneaking = true;
+      });
+      return;
+    }
+
+    // Just came off a block: wait before putting it up again. Without this the bot spends the
+    // whole fight behind the shield, which stops it playing at all - the shield version of
+    // standing still.
+    if (tick < this.blockCooldownUntil) {
+      if (this.blocking) this.lowerShield();
+      return;
+    }
+
+    // Raise it for something specific: an arrow that has been noticed, or a beating being
+    // taken at a range where swinging back is not on offer yet.
+    const threatSeen = this.threat && tick >= (this.threat.noticeAt ?? Infinity) && isAlive(this.threat.entity);
+    const underPressure = this.beingCombod(tick) && dist > this.profile.reach * 0.8;
+    // Nothing is lost by blocking during the opponent's invulnerability window - the swing
+    // that would have been given up could not have landed anyway. Knowing that is most of
+    // what separates a player who owns a shield from one who uses it.
+    const nothingToLose =
+      this.healthFraction < 0.5 &&
+      this.target &&
+      ticksSinceDamage(this.target.id, tick) < IFRAME_TICKS - 2 &&
+      dist < this.profile.reach + 1.5;
+
+    if ((threatSeen || underPressure || nothingToLose) && this.rng.chance(p.shieldSkill)) {
+      // Held briefly and then dropped. Every tick behind the shield is a tick not spent
+      // hitting back, so a good player's shield goes up for a moment and comes straight down.
+      this.blockUntil = tick + this.rng.int(4, 10);
+      this.blockCooldownUntil = this.blockUntil + this.rng.int(24, 60);
+      this.blocking = true;
+      setBlocking(this.entity, true);
+      safe(() => {
+        this.entity.isSneaking = true;
+      });
+      return;
+    }
+
+    if (this.blocking) this.lowerShield();
+  }
+
+  lowerShield() {
+    this.blocking = false;
+    setBlocking(this.entity, false);
+    safe(() => {
+      this.entity.isSneaking = false;
+    });
   }
 
   /* -------------------------------------------------------------- melee */
@@ -719,7 +815,7 @@ export class BotBrain {
    * the whole fight overshooting - so at range it is a plain vertical hop, which is what a
    * player actually does to crit someone standing in front of them.
    */
-  critJump() {
+  critJump(tick) {
     const closing = this.closing === true;
     const flat = this.perceived
       ? V.normalizeXZ(V.sub(this.perceived.location, this.entity.location))
@@ -729,16 +825,21 @@ export class BotBrain {
     // of the bot's speed on a tangent, and with only a sliver of air control it would sail
     // off that tangent for the whole jump and land out of reach. This is the last tick where
     // full ground acceleration is available, so it is the only chance to aim the arc.
+    this.jumpTick = tick;
     const speed = moveSpeed(closing && this.sprinting) * (closing ? 1 : 0.55);
     driveHorizontal(this.entity, flat.x * speed, flat.z * speed);
 
-    jump(this.entity, { sprinting: closing && this.sprinting, forward: closing ? flat : undefined });
+    jump(this.entity, { sprinting: closing && this.sprinting, forward: closing ? flat : undefined, tick: this.jumpTick });
   }
 
   meleeRoutine(tick, dist, vertical) {
     const p = this.profile;
     const reach = Math.min(p.reach, BASE_REACH + 0.05);
     const inRange = dist <= reach && Math.abs(vertical) <= 2.0;
+
+    // You cannot swing with the shield up. A bot that attacks through its own block is the
+    // same tell as a bot that blocks through its own swing.
+    if (this.blocking) return;
 
     const melee = this.preferredMelee();
     if (melee) switchMainhand(this.entity, melee);
@@ -781,7 +882,7 @@ export class BotBrain {
       // jump-crit so that the apex lines up with the moment invulnerability ends;
       // a bad bot just mashes through it for nothing.
       if (canCrit && onGround && since >= 4 && since <= 7 && this.rng.chance(p.critSkill)) {
-        this.critJump();
+        this.critJump(tick);
         this.critWaitUntil = tick + 8;
         return;
       }
@@ -789,7 +890,7 @@ export class BotBrain {
     } else if (canCrit && onGround && this.rng.chance(p.critSkill)) {
       // Opening hit of an exchange: hop first, connect on the way down. Same aimed run-up as
       // the in-combo case, otherwise this one sails off whatever tangent the strafe was on.
-      this.critJump();
+      this.critJump(tick);
       this.critWaitUntil = tick + 8;
       return;
     }
@@ -852,7 +953,7 @@ export class BotBrain {
       // the bow pulled back is not something a player can do.
       speedScale: this.bow.charging ? 0.3 : 0.9,
     });
-    stepWithTerrain(this.entity, vel, { sprinting: false, airControl: p.kbControl });
+    stepWithTerrain(this.entity, vel, { sprinting: false, airControl: p.kbControl, tick });
     this.faceBody(vel.dir, V.lengthXZ(vel) > 0.02, tick);
     this.sprinting = false;
 
@@ -897,9 +998,13 @@ export class BotBrain {
 
     if (tick < this.eatingUntil) {
       setUsing(this.entity, USING_ITEM);
-      // Vanilla plays the eat sound repeatedly through the animation.
-      if ((this.eatingUntil - tick) % 5 === 0) {
+      setBlocking(this.entity, false);
+      this.blocking = false;
+      // Vanilla plays the eat sound and throws crumbs on a repeating beat through the whole
+      // animation - the mouth also moves, which the resource pack drives off the same state.
+      if ((this.eatingUntil - tick) % 4 === 0) {
         safe(() => this.entity.dimension.playSound('random.eat', this.entity.location, { volume: 0.7 }));
+        spawnEatCrumbs(this.entity);
       }
       // Committed: back away while it finishes, and keep facing the threat.
       const vel = combatVelocity({
@@ -909,7 +1014,7 @@ export class BotBrain {
         sprinting: false,
         speedScale: 0.3,
       });
-      stepWithTerrain(this.entity, vel, { sprinting: false, airControl: p.kbControl });
+      stepWithTerrain(this.entity, vel, { sprinting: false, airControl: p.kbControl, tick });
       this.faceBody(vel.dir, true, tick);
       this.sprinting = false;
       return true;

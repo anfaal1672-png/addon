@@ -83,6 +83,7 @@ export const LEVELS = [
     reactionJitter: 0.45,
     lapseChance: 0.35,
     tremor: 0.55,
+    shieldSkill: 0.0,
   },
   {
     level: 2,
@@ -110,6 +111,7 @@ export const LEVELS = [
     reactionJitter: 0.38,
     lapseChance: 0.22,
     tremor: 0.4,
+    shieldSkill: 0.15,
   },
   {
     level: 3,
@@ -137,6 +139,7 @@ export const LEVELS = [
     reactionJitter: 0.3,
     lapseChance: 0.12,
     tremor: 0.26,
+    shieldSkill: 0.4,
   },
   {
     level: 4,
@@ -164,6 +167,7 @@ export const LEVELS = [
     reactionJitter: 0.22,
     lapseChance: 0.05,
     tremor: 0.15,
+    shieldSkill: 0.7,
   },
   {
     level: 5,
@@ -191,6 +195,7 @@ export const LEVELS = [
     reactionJitter: 0.16,
     lapseChance: 0.015,
     tremor: 0.07,
+    shieldSkill: 0.95,
   },
 ];
 

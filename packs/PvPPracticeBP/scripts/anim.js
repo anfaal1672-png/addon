@@ -57,3 +57,32 @@ export function setUsing(entity, mode) {
     entity.setProperty('pvp:using', mode);
   });
 }
+
+/**
+ * Raises or lowers the shield.
+ *
+ * This drives both halves of blocking: the resource pack plays the player's own
+ * shield-block pose off it, and the behaviour pack's damage sensor negates melee and
+ * projectile damage while it is true - a shield that only looked like a shield would be
+ * worse than not having one.
+ */
+export function setBlocking(entity, blocking) {
+  safe(() => {
+    if (entity.getProperty('pvp:blocking') === blocking) return;
+    entity.setProperty('pvp:blocking', blocking);
+  });
+}
+
+/** Crumbs from the mouth while eating. Vanilla emits item particles; script cannot, so the
+ *  resource pack ships a small emitter that looks the same. */
+export function spawnEatCrumbs(entity) {
+  safe(() => {
+    const head = entity.getHeadLocation();
+    const dir = entity.getViewDirection();
+    entity.dimension.spawnParticle('pvp:eat_crumbs', {
+      x: head.x + dir.x * 0.32,
+      y: head.y - 0.18,
+      z: head.z + dir.z * 0.32,
+    });
+  });
+}

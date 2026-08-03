@@ -241,15 +241,8 @@ export function installEvents() {
       if (victim.typeId === BOT_TYPE) {
         const brain = brains.get(victim.id);
         brain?.onHurt(tick, attacker);
-        // A custom entity has no sound events of its own, so hitting the bot was silent.
-        // Played from script rather than declared in sounds.json, because that file is
-        // replace-not-merge on some builds and would take the vanilla sound table with it.
-        safe(() =>
-          victim.dimension.playSound('game.player.hurt', victim.location, {
-            volume: 1,
-            pitch: randRange(0.9, 1.1),
-          })
-        );
+        // No hurt sound is played here. The engine already plays one for the entity, and
+        // adding ours on top made every hit land with a double thud.
         // Vanilla charges armour one point of durability per four damage taken, minimum one.
         const wear = Math.max(1, Math.floor(amount / 4));
         for (const slot of ARMOUR_EQUIPMENT_SLOTS) damageEquipment(victim, slot, wear);

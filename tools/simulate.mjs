@@ -89,10 +89,15 @@ const dimension = {
   },
   // combat.js emits this particle on a critical, which gives us a free crit counter.
   crits: 0,
+  particles: new Map(),
   spawnParticle(id) {
     if (id === 'minecraft:critical_hit_emitter') this.crits++;
+    this.particles.set(id, (this.particles.get(id) ?? 0) + 1);
   },
-  playSound() {},
+  sounds: [],
+  playSound(id) {
+    this.sounds.push(id);
+  },
 };
 
 /** A fresh proxy over the same underlying entity, mimicking the script API's wrappers. */
@@ -172,6 +177,13 @@ class FakeEntity {
   }
 
   applyDamage(amount) {
+    // The behaviour pack's damage sensor negates melee and projectile damage while the
+    // pvp:blocking property is set, so the harness has to honour it too or the shield would
+    // "work" in the test and do nothing in game.
+    if (this.properties.get('pvp:blocking') === true) {
+      this.blockedHits = (this.blockedHits ?? 0) + 1;
+      return false;
+    }
     // Crude armour model, only so the simulation is not wildly unrealistic.
     const reduced = amount * (1 - Math.min(0.8, this.armour * 0.04));
     this.damageTaken += reduced;
@@ -398,6 +410,7 @@ function archery(level, { ticks = 600, range = 20 } = {}) {
 
   const errors = [];
   const speeds = [];
+  let drawTicks = 0;
 
   for (let tick = 1; tick <= ticks; tick++) {
     const before = dimension.shots.length;
@@ -417,6 +430,8 @@ function archery(level, { ticks = 600, range = 20 } = {}) {
       }
     }
 
+    if (botEntity.properties.get('pvp:using') === 2) drawTicks++;
+
     dummy.velocity.x = Math.cos(tick / 10) * 0.2159;
     dummy.velocity.z = -Math.sin(tick / 10) * 0.2159;
 
@@ -432,6 +447,7 @@ function archery(level, { ticks = 600, range = 20 } = {}) {
     meanErrorDeg: mean(errors),
     // Arrow speed is proportional to draw strength, which is proportional to damage.
     meanCharge: mean(speeds) / ARROW_SPEED,
+    drawTicks,
   };
 }
 
@@ -510,6 +526,118 @@ function jumpHeight() {
     if (bot.location.y <= GROUND_Y && i > 2) break;
   }
   return { apex: apex - GROUND_Y, residual };
+}
+
+/* ------------------------------------------------- movement and behaviour */
+
+/**
+ * Watches a fight and reports the things that were reported wrong in play testing:
+ * how much of the time the bot sprints, how straight it runs, how high it ever gets off the
+ * ground, whether the shield goes up and comes back down, and whether eating and drawing look
+ * like a player doing those things.
+ */
+function behaviourProfile(level, { kit = 'netherite', ticks = 900 } = {}) {
+  dimension.entities.length = 0;
+  dimension.particles.clear();
+  dimension.sounds.length = 0;
+
+  const bot = new FakeEntity('pvp:bot', { x: 0, y: GROUND_Y, z: 0 });
+  applyKit(bot, kit);
+  const brain = new BotBrain(bot, {
+    level,
+    kit,
+    home: { location: { x: 0, y: GROUND_Y, z: 0 }, dimensionId: 'overworld' },
+  });
+
+  const dummy = new FakeEntity('minecraft:player', { x: 8, y: GROUND_Y, z: 0 });
+  dummy.invincible = true;
+
+  let sprintTicks = 0;
+  let freeTicks = 0;
+  let blockTicks = 0;
+  let attackedWhileBlocking = 0;
+  let maxApex = 0;
+  let usingBow = 0;
+  let usingItem = 0;
+  const headings = [];
+
+  for (let tick = 1; tick <= ticks; tick++) {
+    const swingsBefore = bot.swings;
+    brain.tick(tick);
+
+    const free = bot.properties.get('pvp:using') !== 1 && bot.properties.get('pvp:blocking') !== true;
+    if (free) {
+      freeTicks++;
+      if (brain.sprinting) sprintTicks++;
+    }
+    if (bot.properties.get('pvp:blocking') === true) {
+      blockTicks++;
+      if (bot.swings > swingsBefore) attackedWhileBlocking++;
+    }
+    if (bot.properties.get('pvp:using') === 2) usingBow++;
+    if (bot.properties.get('pvp:using') === 1) usingItem++;
+
+    // Circle the opponent and keep hitting the bot so it wants its shield and its apples.
+    dummy.velocity.x = Math.cos(tick / 18) * 0.2159;
+    dummy.velocity.z = -Math.sin(tick / 18) * 0.2159;
+    if (tick % 11 === 0) {
+      bot.applyDamage(4);
+      brain.onHurt(tick, dummy);
+    }
+    if (bot._health < 6) bot._health = 12;
+
+    physics(bot);
+    physics(dummy);
+
+    maxApex = Math.max(maxApex, bot.location.y - GROUND_Y);
+    const speed = Math.hypot(bot.velocity.x, bot.velocity.z);
+    if (speed > 0.05) headings.push((Math.atan2(bot.velocity.x, bot.velocity.z) * 180) / Math.PI);
+  }
+
+  // How much the heading actually varies: a bot on rails produces almost none.
+  let headingChange = 0;
+  for (let i = 1; i < headings.length; i++) {
+    let d = ((headings[i] - headings[i - 1] + 540) % 360) - 180;
+    headingChange += Math.abs(d);
+  }
+
+  return {
+    level,
+    sprintFraction: freeTicks ? sprintTicks / freeTicks : 0,
+    blockFraction: blockTicks / ticks,
+    attackedWhileBlocking,
+    blockedHits: bot.blockedHits ?? 0,
+    maxApex,
+    usingBow,
+    usingItem,
+    headingVariance: headings.length > 1 ? headingChange / (headings.length - 1) : 0,
+    crumbs: dimension.particles.get('pvp:eat_crumbs') ?? 0,
+  };
+}
+
+/**
+ * Two jumps requested on the same tick must produce one jump.
+ *
+ * `getVelocity()` reports the velocity from the start of the tick, so the second call cannot
+ * see the first one's impulse: it cancels a residual that is no longer there and adds a whole
+ * second launch. That is the "sometimes it flies really high" bug.
+ */
+function doubleJump() {
+  dimension.entities.length = 0;
+  const bot = new FakeEntity('pvp:bot', { x: 0, y: GROUND_Y, z: 0 });
+  for (let i = 0; i < 5; i++) physics(bot);
+
+  jump(bot, { tick: 100 });
+  jump(bot, { tick: 100 });
+  jump(bot, { tick: 100 });
+
+  let apex = bot.location.y;
+  for (let i = 0; i < 40; i++) {
+    physics(bot);
+    apex = Math.max(apex, bot.location.y);
+    if (bot.location.y <= GROUND_Y && i > 2) break;
+  }
+  return apex - GROUND_Y;
 }
 
 /* ---------------------------------------------------------- human factors */
@@ -882,6 +1010,12 @@ expect(still.every((r) => r.closestApproach < 3.0), 'every level actually closes
 expect(still[0].critRate < 0.05, `level 1 essentially never crits (${(still[0].critRate * 100).toFixed(0)}%)`);
 expect(bows.every((r) => r.shots > 0), 'every level actually fires its bow at long range');
 expect(
+  bows.every((r) => r.drawTicks > 0),
+  // The resource pack turns this into the player's draw pose and ramps the vanilla bow
+  // attachable, which is what puts the arrow on the string.
+  `the drawing state reaches the client (${bows.map((r) => r.drawTicks).join('/')} ticks)`
+);
+expect(
   bows[4].meanErrorDeg < bows[0].meanErrorDeg,
   `bow aim tightens with level (${bows[0].meanErrorDeg.toFixed(1)}° -> ${bows[4].meanErrorDeg.toFixed(1)}°)`
 );
@@ -943,6 +1077,67 @@ expect(
   `strafing levels do not move as mirror images (worst ${Math.min(
     ...strafers.map((t) => t.mirrorDivergence)
   ).toFixed(2)} blocks)`
+);
+
+const behaviours = [1, 3, 5].map((l) => behaviourProfile(l));
+console.log('\nBehaviour over a 45-second fight (netherite kit, opponent hits back)');
+console.log('  Lv   sprint  heading var  shield  blocked  apex   bow   eat  crumbs');
+for (const b of behaviours) {
+  console.log(
+    `  ${b.level}   ${(b.sprintFraction * 100).toFixed(0).padStart(5)}%  ` +
+      `${b.headingVariance.toFixed(1).padStart(9)}°  ` +
+      `${(b.blockFraction * 100).toFixed(0).padStart(5)}%  ${String(b.blockedHits).padStart(7)}  ` +
+      `${b.maxApex.toFixed(2).padStart(4)}  ${String(b.usingBow).padStart(4)}  ` +
+      `${String(b.usingItem).padStart(4)}  ${b.crumbs}`
+  );
+}
+
+expect(
+  behaviours.filter((b) => b.level > 1).every((b) => b.sprintFraction > 0.6),
+  `sprinting is the default above level 1 (${behaviours.map((b) => (b.sprintFraction * 100).toFixed(0) + '%').join(', ')})`
+);
+expect(
+  behaviours.every((b) => b.headingVariance > 1),
+  `no level runs in a dead straight line (${behaviours.map((b) => b.headingVariance.toFixed(1) + '°').join(', ')})`
+);
+expect(
+  behaviours.every((b) => b.maxApex < 1.35),
+  `nothing ever jumps higher than a player can (highest ${Math.max(...behaviours.map((b) => b.maxApex)).toFixed(2)} blocks)`
+);
+expect(
+  behaviours.find((b) => b.level === 5).blockFraction > 0.02,
+  `a skilled bot actually uses its shield (${(behaviours.find((b) => b.level === 5).blockFraction * 100).toFixed(0)}% of ticks)`
+);
+expect(
+  behaviours.every((b) => b.blockFraction < 0.3),
+  `the shield is not parked up (highest ${(Math.max(...behaviours.map((b) => b.blockFraction)) * 100).toFixed(0)}% of ticks)`
+);
+expect(
+  behaviours.find((b) => b.level === 5).blockedHits > 0,
+  `blocking actually stops damage (${behaviours.find((b) => b.level === 5).blockedHits} hits blocked)`
+);
+expect(
+  behaviours.find((b) => b.level === 1).blockFraction === 0,
+  'a beginner never touches the shield'
+);
+expect(
+  behaviours.every((b) => b.attackedWhileBlocking === 0),
+  'no bot swings while its own shield is up'
+);
+expect(
+  behaviours.some((b) => b.usingItem > 0) && behaviours.some((b) => b.crumbs > 0),
+  `eating shows the animation state and throws crumbs (${behaviours.map((b) => b.crumbs).join('/')})`
+);
+expect(
+  !dimension.sounds.includes('game.player.hurt'),
+  'no script-played hurt sound - the engine already plays one, two was the bug'
+);
+
+const doubleApex = doubleJump();
+console.log(`\nThree jumps on one tick reach ${doubleApex.toFixed(4)} blocks`);
+expect(
+  Math.abs(doubleApex - vanillaJumpApex()) < 0.02,
+  `jumping repeatedly in one tick still only jumps once (${doubleApex.toFixed(3)} vs ${vanillaJumpApex().toFixed(3)})`
 );
 
 const jumpResult = jumpHeight();

@@ -62,19 +62,38 @@ export function setBodyRotation(entity, yaw, pitch) {
   safe(() => entity.setRotation({ x: clamp(pitch, -89, 89), y: yaw }));
 }
 
+/** entityId -> tick of that entity's last jump, so nothing can jump twice in one tick. */
+const lastJumpTick = new Map();
+
+export function forgetJumps(entityId) {
+  lastJumpTick.delete(entityId);
+}
+
 /**
  * Jumps with exactly a player's launch velocity, which is what makes the apex land at the
  * vanilla 1.25 blocks.
+ *
+ * Two things have to be right:
  *
  * `applyImpulse` *adds* to the current velocity, and an entity resting on the ground is not
  * at rest vertically - it still carries the small negative y velocity from the gravity that
  * was applied before the collision stopped it. Adding 0.42 to that produced a jump visibly
  * short of a player's, so the residual is cancelled out first.
+ *
+ * And only one jump may happen per tick. `getVelocity()` reports the velocity as of the start
+ * of the tick, so a second jump in the same tick cannot see the first one's impulse: it
+ * cancels a residual that is no longer there and adds a second full launch on top, sending
+ * the bot roughly twice as high. Terrain handling, the dodge and the crit set-up can all fire
+ * on the same tick, which is exactly how that happened.
  */
-export function jump(entity, { sprinting = false, forward } = {}) {
+export function jump(entity, { sprinting = false, forward, tick } = {}) {
   return (
     safe(() => {
       if (!entity.isOnGround) return false;
+      if (tick !== undefined) {
+        if (lastJumpTick.get(entity.id) === tick) return false;
+        lastJumpTick.set(entity.id, tick);
+      }
       const boost = sprinting && forward ? SPRINT_JUMP_BOOST : 0;
       const vy = entity.getVelocity().y;
       entity.applyImpulse({
@@ -190,7 +209,7 @@ export function combatVelocity({ toTarget, approach, strafe, sprinting, speedSca
  * hops up single blocks, jumps small gaps, and refuses to walk into lava or off a cliff.
  * @returns {{blocked: boolean, gap: number, hazard: boolean, jumped: boolean}}
  */
-export function stepWithTerrain(entity, velocity, { sprinting, allowFall = false, airControl = 1 }) {
+export function stepWithTerrain(entity, velocity, { sprinting, allowFall = false, airControl = 1, tick }) {
   const dir = V.normalizeXZ(velocity);
   let jumped = false;
   let blocked = false;
@@ -206,9 +225,9 @@ export function stepWithTerrain(entity, velocity, { sprinting, allowFall = false
   }
 
   if (probe.step) {
-    jumped = jump(entity, { sprinting, forward: dir });
+    jumped = jump(entity, { sprinting, forward: dir, tick });
   } else if (probe.gap > 0 && probe.gap < 3) {
-    jumped = jump(entity, { sprinting: true, forward: dir });
+    jumped = jump(entity, { sprinting: true, forward: dir, tick });
   } else if (probe.wall) {
     blocked = true;
     // Two blocks tall or more: jumping will not clear it, so go round. Whichever side is
@@ -227,7 +246,7 @@ export function stepWithTerrain(entity, velocity, { sprinting, allowFall = false
       });
       return { blocked, gap: probe.gap, hazard: probe.hazard, jumped: false, detour: true };
     }
-    jumped = jump(entity, { sprinting, forward: dir });
+    jumped = jump(entity, { sprinting, forward: dir, tick });
   }
 
   driveHorizontal(entity, velocity.x, velocity.z, { airControl });

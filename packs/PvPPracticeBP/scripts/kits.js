@@ -378,6 +378,18 @@ export function damageEquipment(bot, slot, amount = 1) {
 
 export const ARMOUR_EQUIPMENT_SLOTS = ARMOUR_SLOTS;
 
+/**
+ * True if the item is in either hand or in the bag.
+ *
+ * `hasItem` only looks at the main hand and the inventory, which misses the off hand - and
+ * the shield lives in the off hand, so the bot could never tell it had one.
+ */
+export function heldOrCarried(bot, typeId) {
+  if (getHeldStack(bot)?.typeId === typeId) return true;
+  if (safe(() => equippable(bot)?.getEquipment(EquipmentSlot.Offhand)?.typeId) === typeId) return true;
+  return countItem(bot, typeId) > 0;
+}
+
 /** True if the bot is carrying, or already holding, an item of this type. */
 export function hasItem(bot, typeId) {
   if (getHeldStack(bot)?.typeId === typeId) return true;

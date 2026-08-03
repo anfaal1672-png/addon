@@ -18,6 +18,11 @@
           "range": [0, 2],
           "default": 0,
           "client_sync": true
+        },
+        "pvp:blocking": {
+          "type": "bool",
+          "default": false,
+          "client_sync": true
         }
       }
     },
@@ -67,6 +72,37 @@
         "breathes_water": false
       },
       "minecraft:knockback_resistance": { "value": 0 },
+      "minecraft:damage_sensor": {
+        "triggers": [
+          {
+            "cause": "entity_attack",
+            "deals_damage": "no",
+            "on_damage": {
+              "filters": {
+                "test": "bool_property",
+                "subject": "self",
+                "domain": "pvp:blocking",
+                "operator": "equals",
+                "value": true
+              }
+            }
+          },
+          {
+            "cause": "projectile",
+            "deals_damage": "no",
+            "on_damage": {
+              "filters": {
+                "test": "bool_property",
+                "subject": "self",
+                "domain": "pvp:blocking",
+                "operator": "equals",
+                "value": true
+              }
+            }
+          }
+        ]
+      },
+
       "minecraft:hurt_on_condition": {
         "damage_conditions": [
           {

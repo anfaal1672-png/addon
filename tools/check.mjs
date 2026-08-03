@@ -201,6 +201,26 @@ for (const variable of ['variable.attack_time', 'variable.use_item_startup_progr
     : fail(`${variable} must be assigned in pre_animation and declared public (declared=${declared} assigned=${assigned})`);
 }
 
+// The shield has to do both halves: look raised, and actually stop damage. Either alone is
+// worse than not having it - a shield that only poses is decoration, and one that only
+// negates damage is invisible protection.
+const sensor = components['minecraft:damage_sensor'];
+const sensorBlocks =
+  Array.isArray(sensor?.triggers) &&
+  sensor.triggers.some(
+    (t) =>
+      String(t.deals_damage) === 'no' &&
+      JSON.stringify(t.on_damage?.filters ?? {}).includes('pvp:blocking')
+  );
+sensorBlocks
+  ? pass('blocking negates damage through the damage sensor')
+  : fail('nothing stops damage while pvp:blocking is set - the shield would be decoration');
+
+const sensorCauses = (sensor?.triggers ?? []).map((t) => t.cause);
+['entity_attack', 'projectile'].every((c) => sensorCauses.includes(c))
+  ? pass('the shield covers melee and projectiles')
+  : fail(`shield only covers ${sensorCauses.join(', ') || 'nothing'}`);
+
 // The bow-draw pose only plays while the engine thinks the mob has a target, so the behaviour
 // pack has to give it one even though targeting decisions are made in script.
 'minecraft:behavior.nearest_attackable_target' in components
@@ -237,6 +257,10 @@ const mustBePlayerAnimations = {
   sneaking: 'animation.player.sneaking',
   bob: 'animation.player.bob',
 };
+animations.shield_block_off_hand === 'animation.player.shield_block_off_hand'
+  ? pass('shield uses the player block pose')
+  : fail(`shield pose should be animation.player.shield_block_off_hand, is ${animations.shield_block_off_hand}`);
+
 const wrongAnimations = Object.entries(mustBePlayerAnimations)
   .filter(([key, expected]) => animations[key] !== expected)
   .map(([key, expected]) => `${key} should be ${expected}, is ${animations[key]}`);
@@ -290,6 +314,7 @@ const monotonic = [
   ['reactionJitter', -1],
   ['lapseChance', -1],
   ['tremor', -1],
+  ['shieldSkill', 1],
 ];
 for (const [key, dir] of monotonic) {
   let ok = true;
