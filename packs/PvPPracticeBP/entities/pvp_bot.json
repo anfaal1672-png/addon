@@ -30,12 +30,35 @@
     "component_groups": {
       "pvp:despawn": {
         "minecraft:instant_despawn": {}
+      },
+
+      "pvp:bow_mode": {
+        "minecraft:shooter": { "def": "minecraft:arrow" },
+        "minecraft:behavior.ranged_attack": {
+          "priority": 2,
+          "burst_shots": 1,
+          "charge_charged_trigger": 0.0,
+          "charge_shoot_trigger": 0.0,
+          "attack_interval_min": 1.0,
+          "attack_interval_max": 2.0,
+          "attack_radius": 24.0,
+          "attack_radius_min": 4.0,
+          "ranged_fov": 90.0,
+          "speed_multiplier": 0.6,
+          "target_in_sight_time": 0.2
+        }
       }
     },
 
     "events": {
       "pvp:despawn": {
         "add": { "component_groups": ["pvp:despawn"] }
+      },
+      "pvp:bow_mode": {
+        "add": { "component_groups": ["pvp:bow_mode"] }
+      },
+      "pvp:melee_mode": {
+        "remove": { "component_groups": ["pvp:bow_mode"] }
       }
     },
 

@@ -13,6 +13,7 @@ import {
   getHeldItem,
   hasLineOfSight,
   isCriticalPosition,
+  lineOfSightFrom,
   swing,
   ticksSinceDamage,
 } from './combat.js';
@@ -29,8 +30,11 @@ import {
 import { consumeHeldItem, forgetHand, hasItem, heldOrCarried, switchMainhand } from './kits.js';
 import { USING_BOW, USING_ITEM, USING_NONE, playSwing, setBlocking, setUsing, spawnEatCrumbs } from './anim.js';
 import {
+  calibrateSpeed,
   combatVelocity,
   driveHorizontal,
+  forgetJumps,
+  forgetSpeed,
   jump,
   moveSpeed,
   setBodyRotation,
@@ -40,6 +44,7 @@ import {
 } from './movement.js';
 import { AimAxis, Delayed, HumanState, aimTuning, sampleLatency } from './human.js';
 import { drawTime, incomingThreat, shootArrow } from './ranged.js';
+import { record } from './diagnostics.js';
 import { getSettings } from './state.js';
 import {
   V,
@@ -134,12 +139,19 @@ export class BotBrain {
     this.strafeUntil = 0;
     this.wanderAngle = 0;
     this.wanderUntil = 0;
+    /** A committed way round a wall, held for a few ticks rather than re-decided every tick. */
+    this.detourDir = { x: 0, z: 0 };
+    this.detourUntil = 0;
     this.aimNoise = { x: 0, y: 0 };
     this.aimNoiseUntil = 0;
     this.threat = undefined;
     this.lastThreatScan = -999;
 
     this.bow = { charging: false, startTick: 0, goalTicks: 20, nextShotTick: 0 };
+    /** True while the engine's ranged-attack goal is attached. */
+    this.bowMode = false;
+    /** undefined until the first attempt tells us whether the component group attaches. */
+    this.bowEngine = undefined;
     this.eatingUntil = 0;
     this.eatingItem = undefined;
     this.eatingSwapBack = undefined;
@@ -150,6 +162,9 @@ export class BotBrain {
 
     /** Sprint state lives here: Entity.isSprinting is read-only, so the engine never has it. */
     this.sprinting = false;
+    /** Sprint is held until something breaks it, then re-rolled - not re-decided every tick. */
+    this.sprintRerollAt = 0;
+    this.sprintResumeAt = 0;
     /** True while the shield is up: no attacking, sneak-speed movement, damage negated. */
     this.blocking = false;
     this.blockUntil = 0;
@@ -216,10 +231,20 @@ export class BotBrain {
 
     // Deciding to disengage is a decision, so it lands a reaction time later rather than on
     // the same tick as the hit that prompted it.
-    if (this.beingCombod(tick) && this.profile.retreatSkill > 0.4) {
+    //
+    // It also has to be worth doing. Running away is only a play if there is something to run
+    // away *to* - an apple to eat, a bow to switch to - and if the health bar says so. Firing
+    // this off any time three hits landed is what produced a bot at full health sprinting off
+    // for three seconds in the middle of a fight it was winning, for no reason anyone could see.
+    if (
+      this.beingCombod(tick) &&
+      this.profile.retreatSkill > 0.4 &&
+      this.healthFraction < 0.5 &&
+      this.hasEscapePlan()
+    ) {
       const delay = Math.round(this.human.decisionLatency(tick));
       this.retreatFrom = tick + delay;
-      this.retreatUntil = tick + delay + Math.round(20 + 40 * this.profile.retreatSkill);
+      this.retreatUntil = tick + delay + Math.round(16 + 24 * this.profile.retreatSkill);
     }
   }
 
@@ -269,17 +294,46 @@ export class BotBrain {
     return this.recentHits.filter((t) => tick - t < 40).length >= 3;
   }
 
+  /**
+   * "Could I see them from over there?" - handed to the terrain code so that going round a
+   * wall goes round it *towards* a place the fight can carry on from.
+   */
+  losTest() {
+    const target = this.target;
+    if (!target) return undefined;
+    const dim = safe(() => this.entity.dimension);
+    if (!dim) return undefined;
+    return (spot) => lineOfSightFrom(dim, { x: spot.x, y: spot.y + 1.62, z: spot.z }, target);
+  }
+
+  /** Whether backing off actually buys anything: something to heal with, or something to shoot. */
+  hasEscapePlan() {
+    if (countItem(this.entity, 'minecraft:golden_apple') > 0) return true;
+    if (countItem(this.entity, 'minecraft:enchanted_golden_apple') > 0) return true;
+    return hasItem(this.entity, 'minecraft:bow') && countItem(this.entity, 'minecraft:arrow') > 0;
+  }
+
   dispose(dimensionLookup) {
     cleanupBlocks(dimensionLookup, this.placed);
     forgetPlacements(this.id);
     forgetHand(this.id);
+    forgetSpeed(this.id);
+    forgetJumps(this.id);
   }
 
   /* ------------------------------------------------------------------ tick */
 
   tick(tick) {
     if (!isAlive(this.entity)) return false;
+    // What this tick asked for, filled in by whichever movement path runs. The speed loop
+    // compares it against the ground actually covered and corrects the command.
+    this.intendedSpeed = 0;
+    const alive = this.think(tick);
+    calibrateSpeed(this.entity, this.intendedSpeed, tick);
+    return alive;
+  }
 
+  think(tick) {
     // Finishing a meal is not conditional on still having an opponent. Driving this from
     // act() meant a bot that killed or lost its target mid-bite stayed frozen holding an
     // apple, and never swapped its weapon back.
@@ -494,6 +548,7 @@ export class BotBrain {
     stopHorizontal(this.entity);
     this.sprinting = false;
     this.bow.charging = false;
+    this.exitBowMode();
     setUsing(this.entity, USING_NONE);
     setBlocking(this.entity, false);
     this.blocking = false;
@@ -531,8 +586,9 @@ export class BotBrain {
       this.rangedRoutine(tick, flat, dist);
       return;
     }
-    if (this.bow.charging) {
+    if (this.bow.charging || this.bowMode) {
       this.bow.charging = false;
+      this.exitBowMode();
       const melee = this.preferredMelee();
       if (melee) switchMainhand(this.entity, melee);
     }
@@ -542,7 +598,9 @@ export class BotBrain {
     const desired = this.desiredRange();
     let approach = 0;
     if (dist > desired + 0.35) approach = 1;
-    else if (dist < desired - 0.7) approach = -0.6;
+    // Only a genuine crowding gets backed out of. A wide band here reads, from the outside,
+    // as a bot that keeps wandering backwards for no reason.
+    else if (dist < desired - 1.0) approach = -0.45;
     // "Holding" still means pushing forward: the opponent is usually backing away, and a
     // bot that idles at its preferred range simply gets walked out of reach.
     else approach = 0.5;
@@ -550,8 +608,16 @@ export class BotBrain {
     // Disengaging is not the same as backing off a step. Small spacing adjustments are made
     // walking backwards while watching the opponent, but a real retreat means turning round
     // and sprinting, so `disengaging` unlocks both the sprint and the full body turn.
+    // Backing off is about buying room to eat, not about leaving. Without the distance cap
+    // each fresh hit extended the retreat, and a level 5 bot would sprint away until its
+    // opponent fell out of its tracking range entirely and it stood there having forgotten
+    // there was a fight - which is also what "it randomly runs off" looks like from the
+    // other end.
     const disengaging =
-      tick >= (this.retreatFrom ?? Infinity) && tick < (this.retreatUntil ?? 0) && p.retreatSkill > 0.3;
+      tick >= (this.retreatFrom ?? Infinity) &&
+      tick < (this.retreatUntil ?? 0) &&
+      p.retreatSkill > 0.3 &&
+      dist < 9;
     if (disengaging) approach = -1;
     this.disengaging = disengaging;
 
@@ -621,16 +687,29 @@ export class BotBrain {
       strafe *= 0.4;
     }
 
-    // Sprinting is the default, not an occasional choice. Bedrock PvP is played sprinting
-    // almost the whole time - walking only happens in the moment after a w-tap, while an item
-    // is being used, and for players who have not learned to hold it. Anything else reads as
-    // someone strolling around a duel.
-    const sprinting =
-      tick > this.sprintPauseUntil &&
-      // Only a beginner spends real time at walking pace.
-      this.rng.chance(0.55 + 0.45 * p.sprintSkill) &&
-      dist > 0.6;
-    this.sprinting = sprinting;
+    // Sprinting is a state you hold, not a decision you retake sixty times a second.
+    //
+    // Re-rolling it every tick - which is what this used to do - meant the bot spent a random
+    // half of every second at walking pace, and since the two speeds are only 30% apart the
+    // net effect was something that never looked like it was running anywhere. Now it holds
+    // sprint until something takes it away (a w-tap, the shield, standing on top of its
+    // opponent) and only lets go of it by mistake, which is what low `sprintSkill` buys.
+    const wantsSprint = tick > this.sprintPauseUntil && dist > 0.6 && !this.blocking;
+    if (this.sprinting) {
+      if (!wantsSprint) {
+        this.sprinting = false;
+      } else if (tick >= this.sprintRerollAt) {
+        this.sprintRerollAt = tick + this.rng.int(20, 60);
+        if (this.rng.chance(0.3 * (1 - p.sprintSkill))) {
+          this.sprinting = false;
+          this.sprintResumeAt = tick + this.rng.int(6, 22);
+        }
+      }
+    } else if (wantsSprint && tick >= this.sprintResumeAt) {
+      this.sprinting = true;
+      this.sprintRerollAt = tick + this.rng.int(20, 60);
+    }
+    const sprinting = this.sprinting;
     this.closing = approach > 0.5;
 
     let speedScale = 1;
@@ -671,12 +750,35 @@ export class BotBrain {
     }
     // Knockback control is real air-strafing now, not a fake speed bonus: a bot with low
     // kbControl barely steers while airborne, so it takes the full ride from every hit.
+    // Going round a wall is a decision that lasts longer than a tick.
+    //
+    // Recomputing it from scratch every tick means the bot steps aside, finds the sidestep
+    // clear, immediately turns back towards the opponent, walks into the wall again, and
+    // repeats - which from outside is a bot grinding along a wall and never getting anywhere.
+    // So the detour is committed to, and dropped once the opponent is actually visible again.
+    if (tick < this.detourUntil) {
+      const seen = hasLineOfSight(this.entity, this.target);
+      if (seen && dist < this.profile.reach + 2) {
+        this.detourUntil = 0;
+      } else {
+        const speed = V.lengthXZ(vel) || moveSpeed(sprinting);
+        vel = { x: this.detourDir.x * speed, z: this.detourDir.z * speed, dir: this.detourDir };
+      }
+    }
+
+    this.intendedSpeed = V.lengthXZ(vel);
     const terrain = stepWithTerrain(this.entity, vel, {
       sprinting,
       allowFall: p.jitter > 0.3,
       airControl: p.kbControl,
       tick,
+      losTest: this.losTest(),
     });
+    if (terrain.detour && terrain.detourDir) {
+      this.detourDir = terrain.detourDir;
+      this.detourUntil = tick + this.rng.int(10, 18);
+    }
+
     this.faceBody(vel.dir, V.lengthXZ(vel) > 0.02, tick);
     setUsing(this.entity, USING_NONE);
 
@@ -706,6 +808,17 @@ export class BotBrain {
 
   hasShield() {
     return heldOrCarried(this.entity, 'minecraft:shield');
+  }
+
+  /** Whether the opponent is inside `degrees` of where the bot is actually pointed. */
+  facingTarget(degrees) {
+    if (!this.perceived) return false;
+    return (
+      safe(() => {
+        const want = directionToRotation(V.sub(this.perceived.location, this.entity.location));
+        return Math.abs(angleDelta(this.bodyYaw, want.y)) <= degrees / 2;
+      }, false) ?? false
+    );
   }
 
   /**
@@ -744,6 +857,13 @@ export class BotBrain {
       return;
     }
 
+    // A shield only blocks what comes at your front on Bedrock, so one that goes up while the
+    // opponent is round the back is not protection, it is just a bot that stopped attacking.
+    if (!this.facingTarget(100)) {
+      if (this.blocking) this.lowerShield();
+      return;
+    }
+
     // Raise it for something specific: an arrow that has been noticed, or a beating being
     // taken at a range where swinging back is not on offer yet.
     const threatSeen = this.threat && tick >= (this.threat.noticeAt ?? Infinity) && isAlive(this.threat.entity);
@@ -752,12 +872,14 @@ export class BotBrain {
     // that would have been given up could not have landed anyway. Knowing that is most of
     // what separates a player who owns a shield from one who uses it.
     const nothingToLose =
-      this.healthFraction < 0.5 &&
       this.target &&
       ticksSinceDamage(this.target.id, tick) < IFRAME_TICKS - 2 &&
       dist < this.profile.reach + 1.5;
+    // Closing the last stretch is the other moment a shield earns its place: there is nothing
+    // to swing at yet and the opponent has every chance to swing first.
+    const closingIn = dist > this.profile.reach && dist < this.profile.reach + 3.5;
 
-    if ((threatSeen || underPressure || nothingToLose) && this.rng.chance(p.shieldSkill)) {
+    if ((threatSeen || underPressure || nothingToLose || closingIn) && this.rng.chance(p.shieldSkill)) {
       // Held briefly and then dropped. Every tick behind the shield is a tick not spent
       // hitting back, so a good player's shield goes up for a moment and comes straight down.
       this.blockUntil = tick + this.rng.int(4, 10);
@@ -934,9 +1056,79 @@ export class BotBrain {
     return far || retreating || noMelee;
   }
 
+  /**
+   * Hands the bow over to the engine.
+   *
+   * Script can pose a bot as if it were drawing, but it cannot make the *item* believe it is
+   * being used - and the arrow on the string is drawn by the bow's own attachable off the
+   * holder's item-use state. So the only way to get an arrow nocked is to let the engine run
+   * the shot: `minecraft:shooter` plus a ranged-attack goal, added as a component group for
+   * exactly as long as the bot is holding the bow. The engine then draws, nocks and looses a
+   * real arrow, all of it identical to any other bow user in the game.
+   *
+   * If the group cannot be attached the script shooter is still there as a fallback, so the
+   * bot shoots either way - it just does not look as good.
+   */
+  enterBowMode() {
+    if (this.bowMode) return this.bowEngine === true;
+    this.bowMode = true;
+    if (this.bowEngine === false) return false;
+    const ok = safe(() => {
+      this.entity.triggerEvent('pvp:bow_mode');
+      return true;
+    }, false);
+    if (this.bowEngine === undefined) {
+      this.bowEngine = ok === true;
+      record(
+        'ranged.engine',
+        this.bowEngine,
+        this.bowEngine
+          ? 'the engine draws and looses the bow - the arrow is nocked on the string'
+          : 'ranged component group unavailable - falling back to script-fired arrows'
+      );
+    }
+    return this.bowEngine === true;
+  }
+
+  exitBowMode() {
+    if (!this.bowMode) return;
+    this.bowMode = false;
+    if (this.bowEngine) safe(() => this.entity.triggerEvent('pvp:melee_mode'));
+  }
+
   rangedRoutine(tick, flat, dist) {
     const p = this.profile;
     switchMainhand(this.entity, 'minecraft:bow');
+
+    if (this.enterBowMode()) {
+      // The engine owns the shot from here: aiming, drawing and firing. All that is left is
+      // to keep the feet moving, because standing still while shooting is the one thing a
+      // real bow player never does.
+      if (tick > this.strafeUntil) {
+        this.strafeSign = this.rng.sign();
+        this.strafeUntil = tick + this.rng.int(20, 40);
+      }
+      const vel = combatVelocity({
+        toTarget: flat,
+        approach: dist < 6 ? -1 : dist > 22 ? 0.7 : 0,
+        strafe: this.strafeSign * p.strafe * 0.8,
+        sprinting: false,
+        speedScale: 0.55,
+      });
+      this.intendedSpeed = V.lengthXZ(vel);
+      stepWithTerrain(this.entity, vel, {
+        sprinting: false,
+        airControl: p.kbControl,
+        tick,
+        losTest: this.losTest(),
+      });
+      this.sprinting = false;
+      // The engine's own charging pose is playing; adding the script one on top would draw
+      // the bow twice.
+      setUsing(this.entity, USING_NONE);
+      this.bow.charging = false;
+      return;
+    }
 
     // Keep moving while drawing: back away if too close, strafe otherwise.
     const approach = dist < 6 ? -1 : dist > 22 ? 0.7 : 0;
@@ -1014,7 +1206,8 @@ export class BotBrain {
         sprinting: false,
         speedScale: 0.3,
       });
-      stepWithTerrain(this.entity, vel, { sprinting: false, airControl: p.kbControl, tick });
+      this.intendedSpeed = V.lengthXZ(vel);
+      stepWithTerrain(this.entity, vel, { sprinting: false, airControl: p.kbControl, tick, losTest: this.losTest() });
       this.faceBody(vel.dir, true, tick);
       this.sprinting = false;
       return true;
@@ -1034,6 +1227,9 @@ export class BotBrain {
     const normal = countItem(this.entity, 'minecraft:golden_apple') > 0;
     if (!enchanted && !normal) return false;
 
+    // The shield comes down before anything else: you cannot wall yourself in, and you
+    // certainly cannot eat, from behind a raised shield.
+    if (this.blocking) this.lowerShield();
     if (getSettings().allowBuilding && p.buildSkill > 0.4) blockOff(this.entity, flat, this.placed, this.placeOpts(tick));
 
     const item = enchanted ? 'minecraft:enchanted_golden_apple' : 'minecraft:golden_apple';
@@ -1054,6 +1250,9 @@ export class BotBrain {
     const item = this.eatingItem;
     this.eatingItem = undefined;
     setUsing(this.entity, USING_NONE);
+    // The meal was the point of backing off, so the retreat ends with it.
+    this.retreatUntil = 0;
+    this.retreatFrom = Infinity;
 
     // The apple is only spent once the animation actually finished - interrupt it and the
     // bot keeps the apple, same as a player. It is eaten out of the hand, falling back to

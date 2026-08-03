@@ -18,6 +18,7 @@ import {
   WEAPON_DAMAGE,
 } from './config.js';
 import { damageEquipment, getEquipment, getHeldStack } from './kits.js';
+import { record } from './diagnostics.js';
 import { getSettings } from './state.js';
 import { V, chance, safe } from './util.js';
 
@@ -62,6 +63,136 @@ export function enchantLevel(item, enchantId) {
   );
 }
 
+/* -------------------------------------------------------------------- armour */
+
+/**
+ * Bedrock armour point values. These are the numbers the vanilla damage formula uses, and
+ * they are the difference between a duel lasting seven seconds and lasting one.
+ */
+export const ARMOUR_POINTS = {
+  'minecraft:leather_helmet': 1,
+  'minecraft:leather_chestplate': 3,
+  'minecraft:leather_leggings': 2,
+  'minecraft:leather_boots': 1,
+  'minecraft:golden_helmet': 2,
+  'minecraft:golden_chestplate': 5,
+  'minecraft:golden_leggings': 3,
+  'minecraft:golden_boots': 1,
+  'minecraft:chainmail_helmet': 2,
+  'minecraft:chainmail_chestplate': 5,
+  'minecraft:chainmail_leggings': 4,
+  'minecraft:chainmail_boots': 1,
+  'minecraft:iron_helmet': 2,
+  'minecraft:iron_chestplate': 6,
+  'minecraft:iron_leggings': 5,
+  'minecraft:iron_boots': 2,
+  'minecraft:turtle_helmet': 2,
+  'minecraft:diamond_helmet': 3,
+  'minecraft:diamond_chestplate': 8,
+  'minecraft:diamond_leggings': 6,
+  'minecraft:diamond_boots': 3,
+  'minecraft:netherite_helmet': 3,
+  'minecraft:netherite_chestplate': 8,
+  'minecraft:netherite_leggings': 6,
+  'minecraft:netherite_boots': 3,
+};
+
+const ARMOUR_SLOTS = ['Head', 'Chest', 'Legs', 'Feet'];
+const PROTECTIONS = ['protection', 'projectile_protection', 'blast_protection', 'fire_protection'];
+
+/** Armour points and total protection levels currently worn. */
+export function armourOf(entity) {
+  return (
+    safe(() => {
+      const eq = entity.getComponent('minecraft:equippable');
+      if (!eq) return { points: 0, protection: 0, known: false };
+      let points = 0;
+      let protection = 0;
+      for (const slot of ARMOUR_SLOTS) {
+        const item = safe(() => eq.getEquipment(EquipmentSlot[slot]));
+        if (!item) continue;
+        points += ARMOUR_POINTS[item.typeId] ?? 0;
+        // Only generic Protection counts against a sword; the others are situational, and
+        // treating them all as equal would make a fire-protection set tank melee.
+        protection += enchantLevel(item, PROTECTIONS[0]);
+      }
+      return { points, protection, known: true };
+    }, { points: 0, protection: 0, known: false }) ?? { points: 0, protection: 0, known: false }
+  );
+}
+
+/**
+ * The fraction of raw damage that survives armour, using Bedrock's formula: 4% per armour
+ * point and 4% per protection level, each capped at 80%.
+ */
+export function armourMultiplier(entity) {
+  const { points, protection } = armourOf(entity);
+  const fromArmour = 1 - Math.min(0.8, points * 0.04);
+  const fromEnchant = 1 - Math.min(0.8, protection * 0.04);
+  return fromArmour * fromEnchant;
+}
+
+/**
+ * Whether the engine reduces script damage by the target's armour.
+ *
+ * The docs do not say, and it decides whether a netherite duel lasts seven seconds or half
+ * of one - so rather than guessing, the first hit that lands on an armoured target is
+ * measured: the health actually lost is compared against the number that was passed in. One
+ * hit settles it, and every hit after that is correct.
+ *
+ * @type {boolean | undefined}
+ */
+let engineAppliesArmour;
+
+export function armourCalibration() {
+  return engineAppliesArmour;
+}
+
+export function resetArmourCalibration(value = undefined) {
+  engineAppliesArmour = value;
+}
+
+function healthOf(entity) {
+  return safe(() => entity.getComponent('minecraft:health')?.currentValue);
+}
+
+/**
+ * Applies `raw` damage, pre-reducing it by the target's armour when the engine does not.
+ * @returns {{dealt: boolean, amount: number}}
+ */
+export function applyMeleeDamage(attacker, target, raw) {
+  const keep = armourMultiplier(target);
+  const amount = engineAppliesArmour === false ? raw * keep : raw;
+
+  const before = engineAppliesArmour === undefined ? healthOf(target) : undefined;
+  const dealt =
+    safe(() => target.applyDamage(amount, { cause: 'entityAttack', damagingEntity: attacker }), false) ?? false;
+
+  // Calibrate only on a hit that carries real information: the target has to be wearing
+  // enough armour for the two hypotheses to give visibly different answers, and the health
+  // reading has to have actually moved.
+  if (dealt && engineAppliesArmour === undefined && keep < 0.75 && before !== undefined) {
+    const after = healthOf(target);
+    if (after !== undefined) {
+      const lost = before - after;
+      if (lost > 0.05) {
+        const expectedRaw = Math.abs(lost - amount);
+        const expectedReduced = Math.abs(lost - amount * keep);
+        engineAppliesArmour = expectedReduced < expectedRaw;
+        record(
+          'combat.armour',
+          true,
+          engineAppliesArmour
+            ? 'the engine reduces script damage by armour - damage is passed raw'
+            : 'the engine does not reduce script damage - armour is applied here'
+        );
+      }
+    }
+  }
+
+  return { dealt, amount };
+}
+
 /* --------------------------------------------------------------- damage maths */
 
 /**
@@ -102,7 +233,15 @@ export function isCriticalPosition(entity) {
 export function hasLineOfSight(attacker, target) {
   const from = safe(() => attacker.getHeadLocation());
   if (!from) return true;
+  return lineOfSightFrom(attacker.dimension, from, target);
+}
 
+/**
+ * The same test from an arbitrary point, so the bot can ask "would I be able to see them if I
+ * stood over there?" - which is what turns walking round a wall into walking round it towards
+ * somewhere useful.
+ */
+export function lineOfSightFrom(dimension, from, target) {
   const aims = [];
   safe(() => aims.push(target.getHeadLocation()));
   safe(() => aims.push({ x: target.location.x, y: target.location.y + 0.9, z: target.location.z }));
@@ -115,7 +254,7 @@ export function hasLineOfSight(attacker, target) {
     if (distance < 0.05) return true;
 
     const blocked = safe(() => {
-      const hit = attacker.dimension.getBlockFromRay(from, V.normalize(delta), {
+      const hit = dimension.getBlockFromRay(from, V.normalize(delta), {
         maxDistance: distance,
         includeLiquidBlocks: false,
         includePassableBlocks: false,
@@ -190,14 +329,7 @@ export function swing(attacker, target, { tick, missChance = 0, forceNoCrit = fa
   const critical = !forceNoCrit && isCriticalPosition(attacker);
   const amount = meleeDamage(item, { critical });
 
-  const dealt = safe(
-    () =>
-      target.applyDamage(amount, {
-        cause: 'entityAttack',
-        damagingEntity: attacker,
-      }),
-    false
-  );
+  const { dealt } = applyMeleeDamage(attacker, target, amount);
 
   if (!dealt) return 'miss';
 

@@ -16,15 +16,23 @@ const scripts = join(ROOT, 'packs', 'PvPPracticeBP', 'scripts');
 const load = (name) => import(pathToFileURL(join(scripts, name)).href);
 
 const { BotBrain } = await load('bot.js');
+const { ARMOUR_POINTS, armourCalibration, meleeDamage, resetArmourCalibration, swing } = await load('combat.js');
+const { calibrateSpeed, probeAhead, speedGain } = await load('movement.js');
+
+/**
+ * Whether the harness's engine reduces script damage by the target's armour. Flipped by the
+ * armour scenario so both possibilities are covered.
+ */
+let engineReducesArmour = false;
 const { applyKit } = await load('kits.js');
-const { ARROW_SPEED, IFRAME_TICKS, LEVELS } = await load('config.js');
+const { ARROW_SPEED, IFRAME_TICKS, LEVELS, SPRINT_SPEED } = await load('config.js');
 const { PLACE_COOLDOWN, placeBlock } = await load('blocks.js');
 const { consumeHeldItem, switchMainhand } = await load('kits.js');
 const { jump } = await load('movement.js');
 const { clearSuppressedErrors, suppressedErrors } = await load('util.js');
 const manager = await load('manager.js');
-const { getStats } = await load('state.js');
-const { system, world } = await import('@minecraft/server');
+const { getSettings, getStats } = await load('state.js');
+const { ItemStack, system, world } = await import('@minecraft/server');
 
 /* ------------------------------------------------------------- fake world */
 
@@ -130,6 +138,9 @@ class FakeEntity {
     this.nameTag = '';
     this.equipment = new Map();
     this.slots = new Array(36).fill(undefined);
+    /** Component groups the behaviour pack's events have attached. */
+    this.groups = new Set();
+    this.events = [];
     this._health = health;
     this._maxHealth = health;
     this.dimension = dimension;
@@ -176,6 +187,16 @@ class FakeEntity {
     return { x: 0, y: 0, z: 1 };
   }
 
+  /** Armour points actually worn, so the harness values what the bot values. */
+  armourPoints() {
+    let points = this.armour;
+    for (const slot of ['Head', 'Chest', 'Legs', 'Feet']) {
+      const item = this.equipment.get(slot);
+      if (item) points += ARMOUR_POINTS[item.typeId] ?? 0;
+    }
+    return points;
+  }
+
   applyDamage(amount) {
     // The behaviour pack's damage sensor negates melee and projectile damage while the
     // pvp:blocking property is set, so the harness has to honour it too or the shield would
@@ -184,8 +205,11 @@ class FakeEntity {
       this.blockedHits = (this.blockedHits ?? 0) + 1;
       return false;
     }
-    // Crude armour model, only so the simulation is not wildly unrealistic.
-    const reduced = amount * (1 - Math.min(0.8, this.armour * 0.04));
+    // Whether the engine reduces *script* damage by armour is not documented, and the answer
+    // decides whether a duel lasts seven seconds or half of one. The harness can be told
+    // either answer, and the add-on is required to come out at the same damage under both.
+    const keep = engineReducesArmour ? 1 - Math.min(0.8, this.armourPoints() * 0.04) : 1;
+    const reduced = amount * keep;
     this.damageTaken += reduced;
     this.hitsTaken++;
     if (this.invincible) return true;
@@ -237,6 +261,11 @@ class FakeEntity {
 
   addEffect() {}
   playAnimation() {}
+  triggerEvent(name) {
+    if (name === 'pvp:bow_mode') this.groups.add('pvp:bow_mode');
+    else if (name === 'pvp:melee_mode') this.groups.delete('pvp:bow_mode');
+    this.events.push(name);
+  }
   getProperty(k) {
     return this.properties.get(k);
   }
@@ -274,15 +303,43 @@ class FakeEntity {
  * momentum carries you through a jump. Using ground friction everywhere - as this simulator
  * originally did - makes anything airborne stop dead and wrongly punishes jump-critting.
  */
+/** Player-sized box, so a bot cannot squeeze past a block it should have to walk around. */
+const HALF_WIDTH = 0.3;
+
+function solidAt(x, y, z) {
+  const block = dimension.getBlock({ x, y, z });
+  return Boolean(block) && !block.isAir && !block.isLiquid;
+}
+
+function moveAxis(entity, axis) {
+  const step = entity.velocity[axis];
+  if (step === 0) return;
+  const before = entity.location[axis];
+  entity.location[axis] = before + step;
+
+  const { x, y, z } = entity.location;
+  const edge = Math.sign(step) * HALF_WIDTH;
+  const px = axis === 'x' ? x + edge : x;
+  const pz = axis === 'z' ? z + edge : z;
+  // Feet and head both have to fit through.
+  if (solidAt(px, y + 0.1, pz) || solidAt(px, y + 1.1, pz)) {
+    entity.location[axis] = before;
+    entity.velocity[axis] = 0;
+  }
+}
+
 function physics(entity) {
   const onGround = entity.location.y <= GROUND_Y + 1e-6 && entity.velocity.y <= 0;
 
   // Vanilla order: move first, *then* apply gravity and drag. Applying gravity before the
   // first move eats part of the launch velocity and makes every jump measure short, which
   // hid the fact that jump height was wrong in the add-on too.
-  entity.location.x += entity.velocity.x;
+  // Axis-separated collision against solid blocks, the same shape vanilla uses. Without it a
+  // bot "walks around" a wall by walking through it, and the obstacle scenario measures
+  // nothing at all.
+  moveAxis(entity, 'x');
   entity.location.y += entity.velocity.y;
-  entity.location.z += entity.velocity.z;
+  moveAxis(entity, 'z');
 
   if (entity.location.y < GROUND_Y) {
     entity.location.y = GROUND_Y;
@@ -407,6 +464,10 @@ function archery(level, { ticks = 600, range = 20 } = {}) {
     kit: 'bow',
     home: { location: { x: 0, y: GROUND_Y, z: 0 }, dimensionId: 'overworld' },
   });
+  // Force the script shooter. On a real build the engine draws and looses the bow (that path
+  // is covered by bowMode()), but the aim model still has to work on builds where the ranged
+  // component group will not attach, and this is the only scenario that exercises it.
+  brain.bowEngine = false;
 
   const errors = [];
   const speeds = [];
@@ -939,6 +1000,266 @@ function placementRules() {
   return { floating, supported, immediate, tooSoon, afterCooldown, looked: looked.length };
 }
 
+/* ---------------------------------------------------------------- armour */
+
+const ARMOUR_SETS = {
+  netherite: {
+    Head: 'minecraft:netherite_helmet',
+    Chest: 'minecraft:netherite_chestplate',
+    Legs: 'minecraft:netherite_leggings',
+    Feet: 'minecraft:netherite_boots',
+  },
+};
+
+/**
+ * How much health one clean sword hit actually takes off an armoured opponent.
+ *
+ * This is the number behind "the bot does insane damage" and "bot duels are over instantly".
+ * The add-on cannot know whether the engine reduces script damage by armour, so it measures
+ * and adapts - and the requirement is that it lands on the same, vanilla-correct figure
+ * whichever way the engine behaves.
+ */
+function armourModel(engineReduces) {
+  engineReducesArmour = engineReduces;
+  resetArmourCalibration();
+  dimension.entities.length = 0;
+
+  const attacker = new FakeEntity('pvp:bot', { x: 0, y: GROUND_Y, z: 0 });
+  applyKit(attacker, 'netherite');
+
+  const target = new FakeEntity('minecraft:player', { x: 2, y: GROUND_Y, z: 0 }, { health: 2000 });
+  for (const [slot, id] of Object.entries(ARMOUR_SETS.netherite)) {
+    target.equipment.set(slot, new ItemStack(id, 1));
+  }
+
+  const expected = meleeDamage(attacker.equipment.get('Mainhand'), { critical: false }) * 0.2;
+
+  let tick = 0;
+  let hits = 0;
+  const start = target._health;
+  // The first hit is the calibration hit and is allowed to be wrong; it is thrown away.
+  let afterFirst = start;
+  while (hits < 13) {
+    tick += IFRAME_TICKS + 1;
+    const result = swing(attacker, target, { tick, forceNoCrit: true, missChance: 0 });
+    if (result !== 'hit') continue;
+    hits++;
+    if (hits === 1) afterFirst = target._health;
+  }
+
+  return {
+    engineReduces,
+    perHit: (afterFirst - target._health) / (hits - 1),
+    expected,
+    calibrated: armourCalibration(),
+  };
+}
+
+/* ------------------------------------------------------- closed-loop speed */
+
+/**
+ * Velocity written by script does not turn into distance at a fixed rate: whether the engine
+ * uses it for this tick's movement or first multiplies it by ground friction depends on
+ * where the script tick lands, and the two answers differ by nearly a factor of two. That is
+ * how a bot ends up "sprinting" at below walking pace.
+ *
+ * Here the harness deliberately delivers only 54.6% of whatever is commanded, and the
+ * requirement is that the bot still ends up travelling at real player speed.
+ */
+function speedLoopConvergence(delivery = 0.546) {
+  const entity = { id: 'speed-loop-test', location: { x: 0, y: GROUND_Y, z: 0 }, isOnGround: true };
+  const want = SPRINT_SPEED;
+  let travelled = 0;
+
+  for (let tick = 1; tick <= 400; tick++) {
+    calibrateSpeed(entity, want, tick);
+    const step = want * speedGain(entity.id) * delivery;
+    entity.location.x += step;
+    if (tick > 300) travelled += step;
+  }
+
+  return { want, actual: travelled / 100, gain: speedGain(entity.id) };
+}
+
+/* ------------------------------------------------------------ bot vs bot */
+
+/**
+ * How long two bots take to kill each other.
+ *
+ * "Bot duels end absurdly fast" is a damage question wearing a pacing costume: a netherite
+ * duel where armour is skipped is roughly one second long, and the same duel with vanilla
+ * armour maths is the better part of ten. This measures it end to end through the real
+ * brains rather than trusting the damage unit test.
+ */
+function botDuel(level, { kit = 'netherite', limit = 1200 } = {}) {
+  resetArmourCalibration();
+  dimension.entities.length = 0;
+
+  const made = [];
+  for (const x of [-3, 3]) {
+    const entity = new FakeEntity('pvp:bot', { x, y: GROUND_Y, z: 0 });
+    applyKit(entity, kit);
+    made.push({
+      entity,
+      brain: new BotBrain(entity, {
+        level,
+        kit,
+        home: { location: { x, y: GROUND_Y, z: 0 }, dimensionId: 'overworld' },
+      }),
+    });
+  }
+
+  const settings = getSettings();
+  const wasBotVsBot = settings.botVsBot;
+  settings.botVsBot = true;
+
+  try {
+    for (let tick = 1; tick <= limit; tick++) {
+      for (const m of made) {
+        if (!m.entity.isValid) continue;
+        const before = m.entity._health;
+        m.brain.tick(tick);
+        if (m.entity._health < before) m.brain.onHurt(tick, undefined);
+      }
+      for (const m of made) if (m.entity.isValid) physics(m.entity);
+      if (made.some((m) => !m.entity.isValid)) return { level, ticks: tick, decided: true };
+    }
+    return { level, ticks: limit, decided: false };
+  } finally {
+    settings.botVsBot = wasBotVsBot;
+  }
+}
+
+/* -------------------------------------------------------------- obstacles */
+
+/**
+ * A pillar in front of the bot: one block high has to be hopped, two or more has to be
+ * walked around towards somewhere the opponent is visible from.
+ *
+ * `probeAhead` used to call a wall "three solid blocks", which left a two-block pillar - the
+ * most common thing anyone ever puts in a bot's way - classed as neither a step nor a wall.
+ * The bot walked into it and kept walking.
+ */
+function obstacleCourse(height) {
+  const walls = [];
+  for (let h = 0; h < height; h++) walls.push({ x: 1, y: GROUND_Y + h, z: 0 });
+
+  const previousGetBlock = dimension.getBlock;
+  const previousRay = dimension.getBlockFromRay;
+  dimension.getBlock = (pos) => {
+    const x = Math.floor(pos.x);
+    const y = Math.floor(pos.y);
+    const z = Math.floor(pos.z);
+    const solid = y < GROUND_Y || walls.some((w) => w.x === x && w.y === y && w.z === z);
+    return { typeId: solid ? 'minecraft:stone' : 'minecraft:air', isAir: !solid, isLiquid: false, setPermutation() {} };
+  };
+  // The pillar blocks the sight line while the bot is still behind it.
+  dimension.getBlockFromRay = (from) => (Math.floor(from.x) <= 0 ? { typeId: 'minecraft:stone' } : undefined);
+
+  try {
+    dimension.entities.length = 0;
+    const bot = new FakeEntity('pvp:bot', { x: 0.2, y: GROUND_Y, z: 0 });
+    applyKit(bot, 'sword');
+    const brain = new BotBrain(bot, {
+      level: 5,
+      kit: 'sword',
+      home: { location: { x: 0, y: GROUND_Y, z: 0 }, dimensionId: 'overworld' },
+    });
+    const dummy = new FakeEntity('minecraft:player', { x: 6, y: GROUND_Y, z: 0 });
+    dummy.invincible = true;
+
+    const probe = probeAhead(bot, { x: 1, z: 0 }, 0.9);
+
+    let jumps = 0;
+    let sidewaysTravel = 0;
+    let closest = Infinity;
+    for (let tick = 1; tick <= 200; tick++) {
+      const yBefore = bot.velocity.y;
+      brain.tick(tick);
+      if (bot.velocity.y > 0.3 && yBefore <= 0.3) jumps++;
+      physics(bot);
+      sidewaysTravel = Math.max(sidewaysTravel, Math.abs(bot.location.z));
+      closest = Math.min(closest, Math.hypot(bot.location.x - dummy.location.x, bot.location.z - dummy.location.z));
+    }
+
+    return { height, probeHeight: probe.height, step: probe.step, wall: probe.wall, jumps, sidewaysTravel, closest };
+  } finally {
+    dimension.getBlock = previousGetBlock;
+    dimension.getBlockFromRay = previousRay;
+  }
+}
+
+/* ------------------------------------------------------- retreat sanity */
+
+/**
+ * Being hit is not a reason to run. Running is a reason to run - and only when there is
+ * something to run to. A bot at full health that turns and sprints off mid-exchange is the
+ * "it randomly backs away for no reason" complaint.
+ */
+function retreatSanity({ healthFraction, escapePlan }) {
+  dimension.entities.length = 0;
+  const bot = new FakeEntity('pvp:bot', { x: 0, y: GROUND_Y, z: 0 });
+  // The sword kit carries no apples and no bow, so there is nothing to disengage towards.
+  applyKit(bot, escapePlan ? 'uhc' : 'sword');
+  const brain = new BotBrain(bot, {
+    level: 5,
+    kit: 'sword',
+    home: { location: { x: 0, y: GROUND_Y, z: 0 }, dimensionId: 'overworld' },
+  });
+  const dummy = new FakeEntity('minecraft:player', { x: 3, y: GROUND_Y, z: 0 });
+  dummy.invincible = true;
+
+  bot._health = 20 * healthFraction;
+  for (let tick = 1; tick <= 6; tick++) brain.onHurt(tick, dummy);
+
+  return brain.retreatUntil > 0;
+}
+
+/* ------------------------------------------------------------ bow mode */
+
+/**
+ * Drawing a bow has to be done by the engine: script can pose the arms, but only the engine
+ * can put the arrow on the string, because the bow attachable reads the holder's item-use
+ * state and nothing in script can write it.
+ */
+function bowMode() {
+  dimension.entities.length = 0;
+  const bot = new FakeEntity('pvp:bot', { x: 0, y: GROUND_Y, z: 0 });
+  applyKit(bot, 'bow');
+  const brain = new BotBrain(bot, {
+    level: 5,
+    kit: 'bow',
+    home: { location: { x: 0, y: GROUND_Y, z: 0 }, dimensionId: 'overworld' },
+  });
+  // Far enough away that the bow is the right tool.
+  const dummy = new FakeEntity('minecraft:player', { x: 18, y: GROUND_Y, z: 0 });
+  dummy.invincible = true;
+
+  let drawing = 0;
+  let doublePosed = 0;
+  for (let tick = 1; tick <= 200; tick++) {
+    brain.tick(tick);
+    if (bot.groups.has('pvp:bow_mode')) {
+      drawing++;
+      // The engine's own charging pose is playing; setting the script one too would draw
+      // the bow twice over.
+      if (bot.properties.get('pvp:using') === 2) doublePosed++;
+    }
+    physics(bot);
+    physics(dummy);
+  }
+
+  // Walking into melee range has to give the bow back.
+  dummy.location = { x: bot.location.x + 1.5, y: bot.location.y, z: bot.location.z };
+  dummy.velocity = { x: 0, y: 0, z: 0 };
+  for (let tick = 201; tick <= 260; tick++) {
+    brain.tick(tick);
+    physics(bot);
+  }
+
+  return { drawing, doublePosed, releasedInMelee: !bot.groups.has('pvp:bow_mode') };
+}
+
 /* ---------------------------------------------------------------- reports */
 
 function table(title, rows) {
@@ -1244,6 +1565,99 @@ expect(!rules.immediate, 'a second block in the same tick is refused');
 expect(!rules.tooSoon, `a second block before the ${PLACE_COOLDOWN}-tick cooldown is refused`);
 expect(rules.afterCooldown, 'placement resumes once the cooldown has passed');
 expect(rules.looked > 0, 'the bot is pointed at each block it places');
+
+/* --------------------------------------------- damage, obstacles, retreat, bow */
+
+const armour = [false, true].map((engine) => armourModel(engine));
+engineReducesArmour = false;
+console.log('\nOne clean sword hit on a netherite-armoured opponent');
+console.log('  engine reduces script damage?   damage per hit   vanilla');
+for (const a of armour) {
+  console.log(
+    `  ${String(a.engineReduces).padEnd(29)}  ${a.perHit.toFixed(2).padStart(13)}  ` +
+      `${a.expected.toFixed(2).padStart(8)}   (detected: ${String(a.calibrated)})`
+  );
+}
+for (const a of armour) {
+  expect(
+    Math.abs(a.perHit - a.expected) < a.expected * 0.05,
+    `armour is applied exactly once when the engine ${a.engineReduces ? 'does' : 'does not'} reduce ` +
+      `script damage (${a.perHit.toFixed(2)} vs ${a.expected.toFixed(2)})`
+  );
+}
+expect(
+  Math.abs(armour[0].perHit - armour[1].perHit) < 0.2,
+  'the same damage comes out whichever way the engine behaves'
+);
+
+const loop = speedLoopConvergence();
+console.log(
+  `\nSprint speed with an engine that only delivers 55% of the command: ` +
+    `${loop.actual.toFixed(4)} vs ${loop.want.toFixed(4)} blocks/tick (gain ${loop.gain.toFixed(2)})`
+);
+expect(
+  Math.abs(loop.actual - loop.want) < loop.want * 0.05,
+  `the bot converges on real player speed regardless of the exchange rate (${loop.actual.toFixed(4)})`
+);
+
+const duels = [1, 3, 5].map((l) => botDuel(l));
+console.log('\nBot against bot, netherite kit: how long until someone dies');
+console.log('  Lv   seconds');
+for (const d of duels) {
+  console.log(`  ${d.level}   ${(d.ticks / 20).toFixed(1).padStart(7)}${d.decided ? '' : '  (nobody died)'}`);
+}
+expect(
+  duels.every((d) => d.ticks / 20 > 4),
+  `a bot duel is a fight, not an execution (shortest ${(Math.min(...duels.map((d) => d.ticks)) / 20).toFixed(1)} s)`
+);
+expect(
+  duels.some((d) => d.decided),
+  'bots can still finish each other off'
+);
+
+const obstacles = [1, 2, 3].map((h) => obstacleCourse(h));
+console.log('\nWalking into a pillar');
+console.log('  height  probe  step  wall  jumps  sideways  closest approach');
+for (const o of obstacles) {
+  console.log(
+    `  ${String(o.height).padStart(6)}  ${String(o.probeHeight).padStart(5)}  ` +
+      `${String(o.step).padStart(5)}  ${String(o.wall).padStart(4)}  ` +
+      `${String(o.jumps).padStart(5)}  ${o.sidewaysTravel.toFixed(2).padStart(8)}  ${o.closest.toFixed(2).padStart(16)}`
+  );
+}
+expect(obstacles[0].probeHeight === 1 && obstacles[0].step, 'a single block reads as a step, not a wall');
+expect(obstacles[0].jumps > 0, `a single block is hopped straight over (${obstacles[0].jumps} jumps)`);
+expect(
+  obstacles.slice(1).every((o) => o.wall && !o.step),
+  'two blocks or more reads as a wall, which no jump clears'
+);
+expect(
+  obstacles.slice(1).every((o) => o.sidewaysTravel > 0.35),
+  `a wall is stepped around rather than ground into (${obstacles[1].sidewaysTravel.toFixed(2)} blocks sideways)`
+);
+expect(
+  obstacles.every((o) => o.closest < 3),
+  `the opponent is reached whatever is in the way (closest ${obstacles.map((o) => o.closest.toFixed(1)).join(' / ')})`
+);
+
+console.log('\nWhen the bot disengages');
+const retreats = [
+  { label: 'full health, nothing to run to', opts: { healthFraction: 1.0, escapePlan: false }, want: false },
+  { label: 'full health, apples in the bag', opts: { healthFraction: 1.0, escapePlan: true }, want: false },
+  { label: 'low health, nothing to run to', opts: { healthFraction: 0.3, escapePlan: false }, want: false },
+  { label: 'low health, apples in the bag', opts: { healthFraction: 0.3, escapePlan: true }, want: true },
+];
+for (const r of retreats) {
+  const got = retreatSanity(r.opts);
+  expect(got === r.want, `${r.label}: ${r.want ? 'disengages' : 'stands and fights'}`);
+}
+
+const bow = bowMode();
+console.log(`\nBow: ${bow.drawing} ticks with the engine drawing, ${bow.doublePosed} double-posed`);
+expect(bow.drawing > 0, `the engine draws the bow, so the arrow is on the string (${bow.drawing} ticks)`);
+expect(bow.doublePosed === 0, 'the script does not pose the draw on top of the engine');
+expect(bow.releasedInMelee, 'the ranged goal is dropped again at melee range');
+
 
 console.log('');
 if (failures) {

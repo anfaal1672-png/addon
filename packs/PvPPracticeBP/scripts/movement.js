@@ -35,6 +35,10 @@ export function driveHorizontal(entity, vx, vz, { airControl = 1 } = {}) {
     const onGround = entity.isOnGround;
     const limit = onGround ? GROUND_ACCEL : AIR_ACCEL * clamp(0.25 + 0.75 * airControl, 0, 1);
 
+    const gain = speedGain(entity.id);
+    vx *= gain;
+    vz *= gain;
+
     let dx = vx - v.x;
     let dz = vz - v.z;
     const mag = Math.hypot(dx, dz);
@@ -48,6 +52,74 @@ export function driveHorizontal(entity, vx, vz, { airControl = 1 } = {}) {
 
 export function stopHorizontal(entity) {
   driveHorizontal(entity, 0, 0);
+}
+
+/* ------------------------------------------------------- closed-loop speed */
+
+/**
+ * Velocity written by script does not become distance travelled at a fixed exchange rate.
+ * Where the script tick lands relative to the engine's own movement step decides whether the
+ * velocity we set is used for this tick's displacement or is first multiplied by ground
+ * friction - and the two answers differ by a factor of nearly two. Setting 0.2806 and hoping
+ * is how a bot ends up sprinting at walking pace, which is exactly what it looked like.
+ *
+ * So the target is not trusted: the distance the bot actually covered is measured every tick
+ * and the command is scaled until the two agree. Whatever the engine is doing underneath, the
+ * bot ends up moving at real player speed.
+ *
+ * @type {Map<string, {gain: number, last?: {x:number,z:number}, want: number, tick: number}>}
+ */
+const speedLoop = new Map();
+
+export const SPEED_GAIN_MIN = 0.8;
+export const SPEED_GAIN_MAX = 2.4;
+
+export function speedGain(entityId) {
+  return speedLoop.get(entityId)?.gain ?? 1;
+}
+
+export function forgetSpeed(entityId) {
+  speedLoop.delete(entityId);
+}
+
+/**
+ * Call once per tick with the speed the bot was *asked* to move at. Compares it against the
+ * ground actually covered since the last call and nudges the gain.
+ */
+export function calibrateSpeed(entity, wantSpeed, tick) {
+  safe(() => {
+    const id = entity.id;
+    let s = speedLoop.get(id);
+    if (!s) {
+      s = { gain: 1, want: 0, tick: -1 };
+      speedLoop.set(id, s);
+    }
+    const here = { x: entity.location.x, z: entity.location.z };
+
+    // Only a tick that follows directly on from the last one, spent running on the ground at
+    // a meaningful speed, says anything about the exchange rate. Knockback, jumps, collisions
+    // and stationary ticks are all noise.
+    const usable =
+      s.last !== undefined &&
+      tick === s.tick + 1 &&
+      s.want > 0.05 &&
+      (safe(() => entity.isOnGround, false) ?? false);
+
+    if (usable) {
+      const moved = Math.hypot(here.x - s.last.x, here.z - s.last.z);
+      // A tick where the bot was walled in covers no ground for reasons that have nothing to
+      // do with the gain, so only believe readings in a plausible band.
+      if (moved > s.want * 0.25 && moved < s.want * 2.5) {
+        const ratio = s.want / moved;
+        // Slew-limited: a jumpy gain would make the bot surge and stall.
+        s.gain = clamp(s.gain * clamp(ratio, 0.94, 1.06), SPEED_GAIN_MIN, SPEED_GAIN_MAX);
+      }
+    }
+
+    s.last = here;
+    s.want = wantSpeed;
+    s.tick = tick;
+  });
 }
 
 /**
@@ -121,11 +193,29 @@ function isSolid(block) {
   return safe(() => !block.isAir && !block.isLiquid, false) ?? false;
 }
 
+const HAZARD_IDS = new Set([
+  'minecraft:lava',
+  'minecraft:flowing_lava',
+  'minecraft:fire',
+  'minecraft:soul_fire',
+  'minecraft:cactus',
+  'minecraft:magma',
+  'minecraft:sweet_berry_bush',
+]);
+
 /**
  * Looks one step ahead along `dir` and reports what the bot is about to walk into.
- * @returns {{wall: boolean, step: boolean, gap: number, hazard: boolean}}
- *  - wall   something blocking at head height that a jump will not clear
- *  - step   a one-block rise the bot can hop up
+ *
+ * The important number here is `height`: how many blocks of solid obstacle are stacked in
+ * front of the bot. Reporting only "wall or not" - and defining a wall as three solid blocks,
+ * which is what this used to do - left the most common obstacle in the game, a two-block
+ * pillar, classed as neither a step nor a wall. The bot walked straight into it and kept
+ * walking. Anyone who ever placed two blocks in front of it saw exactly that.
+ *
+ * @returns {{height: number, wall: boolean, step: boolean, gap: number, hazard: boolean}}
+ *  - height how many solid blocks are stacked ahead, from foot level up (0 = clear path)
+ *  - step   a one-block rise, which a jump clears
+ *  - wall   two or more, which it does not
  *  - gap    how far down the floor is ahead (0 = flat, large = a drop or the void)
  *  - hazard lava / fire / a cactus directly ahead
  */
@@ -136,11 +226,18 @@ export function probeAhead(entity, dir, distance = 0.9) {
   const az = loc.z + dir.z * distance;
 
   const feet = blockAt(dim, ax, loc.y, az);
-  const head = blockAt(dim, ax, loc.y + 1, az);
-  const above = blockAt(dim, ax, loc.y + 2, az);
-
   const feetSolid = isSolid(feet);
-  const headSolid = isSolid(head);
+
+  // Count the stack. Anything past head height plus one cannot be jumped anyway, so three
+  // is as far as this needs to look.
+  let height = 0;
+  if (feetSolid) {
+    height = 1;
+    for (let d = 1; d <= 2; d++) {
+      if (!isSolid(blockAt(dim, ax, loc.y + d, az))) break;
+      height = d + 1;
+    }
+  }
 
   let gap = 0;
   if (!feetSolid) {
@@ -150,25 +247,73 @@ export function probeAhead(entity, dir, distance = 0.9) {
     }
   }
 
-  const hazardIds = new Set([
-    'minecraft:lava',
-    'minecraft:flowing_lava',
-    'minecraft:fire',
-    'minecraft:soul_fire',
-    'minecraft:cactus',
-    'minecraft:magma',
-    'minecraft:sweet_berry_bush',
-  ]);
   const hazard =
-    (safe(() => hazardIds.has(feet?.typeId ?? ''), false) ?? false) ||
-    (safe(() => hazardIds.has(blockAt(dim, ax, loc.y - 1, az)?.typeId ?? ''), false) ?? false);
+    (safe(() => HAZARD_IDS.has(feet?.typeId ?? ''), false) ?? false) ||
+    (safe(() => HAZARD_IDS.has(blockAt(dim, ax, loc.y - 1, az)?.typeId ?? ''), false) ?? false);
 
   return {
-    wall: feetSolid && headSolid && isSolid(above),
-    step: feetSolid && !headSolid,
+    height,
+    // A single block is a hop; the bot also needs headroom to make it, which is what the
+    // second test is for - hopping into a one-block hole with a ceiling is not a plan.
+    step: height === 1 && !isSolid(blockAt(dim, ax, loc.y + 2, az)),
+    wall: height >= 2,
     gap,
     hazard,
   };
+}
+
+/**
+ * Walkability of one step in `dir`: can the bot travel that way without a wall, a hazard or
+ * a fall in the way.
+ */
+function walkable(entity, dir, distance = 1.1) {
+  const p = probeAhead(entity, dir, distance);
+  return !p.wall && !p.hazard && p.gap < 3;
+}
+
+/**
+ * Finds a direction that gets the bot to somewhere it can actually see its opponent from.
+ *
+ * A wall taller than a jump is not a thing to shuffle sideways against - it is a thing to go
+ * round. Candidate headings are fanned out either side of the direct line and scored on
+ * whether a step that way is walkable and whether the line to the opponent opens up from
+ * there. The result is a bot that peels off around a pillar instead of grinding into it.
+ *
+ * @param {{x:number,z:number}} toTarget unit vector towards the opponent
+ * @returns {{x:number,z:number} | undefined}
+ */
+export function findOpening(entity, toTarget, { losTest, probeDistance = 1.1, lookAhead = 2.2 } = {}) {
+  const angles = [35, -35, 60, -60, 90, -90, 125, -125, 155, -155];
+  let best;
+  let bestScore = -Infinity;
+
+  for (const deg of angles) {
+    const dir = rotateUnit(toTarget, deg);
+    if (!walkable(entity, dir, probeDistance)) continue;
+
+    // Prefer headings that keep making progress towards the opponent, and strongly prefer
+    // ones that restore the line of sight - that is the whole point of moving.
+    let score = -Math.abs(deg) / 180;
+    if (losTest) {
+      const from = safe(() => entity.location);
+      if (from) {
+        const spot = { x: from.x + dir.x * lookAhead, y: from.y, z: from.z + dir.z * lookAhead };
+        if (safe(() => losTest(spot), false)) score += 2;
+      }
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = dir;
+    }
+  }
+  return best;
+}
+
+function rotateUnit(dir, degrees) {
+  const r = (degrees * Math.PI) / 180;
+  const c = Math.cos(r);
+  const s = Math.sin(r);
+  return { x: dir.x * c - dir.z * s, z: dir.x * s + dir.z * c };
 }
 
 /** True when there is nothing under the entity for `depth` blocks - i.e. it is over a hole. */
@@ -209,46 +354,53 @@ export function combatVelocity({ toTarget, approach, strafe, sprinting, speedSca
  * hops up single blocks, jumps small gaps, and refuses to walk into lava or off a cliff.
  * @returns {{blocked: boolean, gap: number, hazard: boolean, jumped: boolean}}
  */
-export function stepWithTerrain(entity, velocity, { sprinting, allowFall = false, airControl = 1, tick }) {
+export function stepWithTerrain(entity, velocity, { sprinting, allowFall = false, airControl = 1, tick, losTest }) {
   const dir = V.normalizeXZ(velocity);
   let jumped = false;
   let blocked = false;
 
-  const probe = dir.x === 0 && dir.z === 0 ? { wall: false, step: false, gap: 0, hazard: false } : probeAhead(entity, dir);
+  const clear = { height: 0, wall: false, step: false, gap: 0, hazard: false };
+  const probe = dir.x === 0 && dir.z === 0 ? clear : probeAhead(entity, dir);
+  const speed = Math.max(V.lengthXZ(velocity), 1e-4);
 
   if (probe.hazard || (!allowFall && probe.gap >= 3)) {
     // Refuse the step: slide sideways instead of walking into lava or off a ledge.
     const side = { x: -dir.z, z: dir.x };
-    const speed = moveSpeed(false);
-    driveHorizontal(entity, side.x * speed, side.z * speed, { airControl });
-    return { blocked: true, gap: probe.gap, hazard: probe.hazard, jumped: false };
+    const walk = moveSpeed(false);
+    driveHorizontal(entity, side.x * walk, side.z * walk, { airControl });
+    return { blocked: true, height: probe.height, gap: probe.gap, hazard: probe.hazard, jumped: false, detour: false };
   }
 
   if (probe.step) {
+    // One block: hop it, now. No roll, no delay - a player does not stop to consider a
+    // single block, they are already over it.
     jumped = jump(entity, { sprinting, forward: dir, tick });
   } else if (probe.gap > 0 && probe.gap < 3) {
     jumped = jump(entity, { sprinting: true, forward: dir, tick });
   } else if (probe.wall) {
     blocked = true;
-    // Two blocks tall or more: jumping will not clear it, so go round. Whichever side is
-    // open gets picked; without this the bot walks into a wall and stays there, which is
-    // what happens the moment an opponent blocks it off.
-    const side = { x: -dir.z, z: dir.x };
-    const speed = moveSpeed(sprinting);
-    const left = probeAhead(entity, side, 1.1);
-    const right = probeAhead(entity, { x: -side.x, z: -side.z }, 1.1);
-    const open = !left.wall && left.gap < 3 ? side : !right.wall && right.gap < 3 ? { x: -side.x, z: -side.z } : undefined;
-
+    // Two or more: no jump clears it, so go and stand somewhere the opponent is visible from
+    // instead of grinding into the masonry.
+    const open = findOpening(entity, dir, { losTest });
     if (open) {
-      // Slide along the wall, keeping a little forward lean so it hugs the corner.
-      driveHorizontal(entity, (open.x * 0.9 + dir.x * 0.3) * speed, (open.z * 0.9 + dir.z * 0.3) * speed, {
+      // A little forward lean so it hugs the corner rather than sliding off at a right angle.
+      driveHorizontal(entity, (open.x * 0.92 + dir.x * 0.25) * speed, (open.z * 0.92 + dir.z * 0.25) * speed, {
         airControl,
       });
-      return { blocked, gap: probe.gap, hazard: probe.hazard, jumped: false, detour: true };
+      return {
+        blocked,
+        height: probe.height,
+        gap: probe.gap,
+        hazard: probe.hazard,
+        jumped: false,
+        detour: true,
+        detourDir: open,
+      };
     }
+    // Boxed in on every heading: a jump is the only thing left to try.
     jumped = jump(entity, { sprinting, forward: dir, tick });
   }
 
   driveHorizontal(entity, velocity.x, velocity.z, { airControl });
-  return { blocked, gap: probe.gap, hazard: probe.hazard, jumped, detour: false };
+  return { blocked, height: probe.height, gap: probe.gap, hazard: probe.hazard, jumped, detour: false };
 }

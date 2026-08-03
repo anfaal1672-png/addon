@@ -233,7 +233,7 @@ export const KITS = {
       'minecraft:diamond_boots',
     ],
     mainhand: 'minecraft:diamond_sword',
-    offhand: undefined,
+    offhand: 'minecraft:shield',
     enchants: {
       'minecraft:diamond_sword': [{ id: 'sharpness', level: 2 }],
       armour: [{ id: 'protection', level: 2 }],

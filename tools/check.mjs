@@ -284,6 +284,30 @@ animateList.includes("bow_equipped") && animateList.includes("pvp:using")
   ? pass('bow pose is gated on the script-driven using property')
   : fail('bow pose is not gated on pvp:using - it will never play, or never stop');
 
+// Blocking has to be *visible*. On Bedrock a shield is used by sneaking, so a bot that
+// negates damage without dropping into the sneak pose reads, from the other end of the
+// fight, as "my hits sometimes do nothing" - which is exactly how it was reported.
+animateList.includes('sneaking') && animateList.includes("pvp:blocking")
+  ? pass('the sneak pose is driven by the blocking property, so blocking is visible')
+  : fail('sneaking is not gated on pvp:blocking - the shield would block damage invisibly');
+
+animateList.includes('sneaking_controller')
+  ? fail('both the sneak controller and the direct sneak animation are in animate - the crouch would apply twice')
+  : pass('the sneak pose is applied exactly once');
+
+// The arrow on the bowstring is drawn by the bow's own attachable from the holder's
+// item-use state, which no script can write. Only the engine's ranged goal produces it.
+const groups = bpEntity?.['minecraft:entity']?.component_groups ?? {};
+const bowGroup = groups['pvp:bow_mode'];
+bowGroup?.['minecraft:shooter'] && bowGroup['minecraft:behavior.ranged_attack']
+  ? pass('bow mode attaches a shooter and a ranged goal, so the engine nocks the arrow')
+  : fail('pvp:bow_mode must carry both minecraft:shooter and minecraft:behavior.ranged_attack');
+
+const bpEvents = bpEntity?.['minecraft:entity']?.events ?? {};
+bpEvents['pvp:bow_mode']?.add && bpEvents['pvp:melee_mode']?.remove
+  ? pass('bow mode can be entered and left again')
+  : fail('pvp:bow_mode / pvp:melee_mode events are missing - the ranged goal would stick');
+
 // animation.player.attack.rotations and move.* need these, and Molang has no defaults.
 for (const variable of ['variable.attack_body_rot_y', 'variable.tcos0']) {
   const scripts = rpEntity?.['minecraft:client_entity']?.description?.scripts ?? {};
@@ -340,6 +364,12 @@ for (const key of ['decisionTicks', 'reactionJitter', 'lapseChance', 'tremor']) 
     ? pass(`every level defines ${key}`)
     : fail(`a level is missing ${key}`);
 }
+
+const { ARMOUR_POINTS } = await import(pathToFileURL(join(scriptDir, 'combat.js')).href);
+const unpricedArmour = KIT_ORDER.flatMap((k) => KITS[k]?.armour ?? []).filter((id) => !(id in ARMOUR_POINTS));
+unpricedArmour.length === 0
+  ? pass('every piece of armour a kit hands out has an armour value')
+  : fail(`armour with no value in the damage table: ${unpricedArmour.join(', ')}`);
 
 const missingKit = KIT_ORDER.find((k) => !KITS[k]);
 missingKit ? fail(`KIT_ORDER references an undefined kit: ${missingKit}`) : pass('every kit in KIT_ORDER exists');
